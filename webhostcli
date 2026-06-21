@@ -199,7 +199,26 @@ nginx_test_reload(){
   systemctl reload nginx
 }
 compose(){ local a="$1"; shift; simulated && return 0; docker compose -p "whc_$a" -f "$(account_dir "$a")/compose.yaml" "$@"; }
-mysql_exec(){ local q="$1"; simulated && return 0; docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$(grep '^MYSQL_ROOT_PASSWORD=' "$(path /etc/hosting-platform/mysql.env)" | cut -d= -f2-)" -e "$q"; }
+mysql_root_password(){
+  local f p
+  # Support both WebhostCLI's fresh-install layout and common legacy bootstrap layouts.
+  for f in "$(path /etc/hosting-platform/mysql.env)" "$(path /srv/hosting/database/.env)" "$(path /srv/hosting/database/mysql.env)"; do
+    [[ -r "$f" ]] || continue
+    p="$(sed -n 's/^MYSQL_ROOT_PASSWORD=//p' "$f" | head -n 1)"
+    [[ -n "$p" ]] && { printf '%s' "$p"; return 0; }
+  done
+  # Docker keeps the configured environment on the existing container. This is read
+  # only by root and is never echoed, logged, or saved by WebhostCLI.
+  p="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$MYSQL_CONTAINER" 2>/dev/null | sed -n 's/^MYSQL_ROOT_PASSWORD=//p' | head -n 1 || true)"
+  [[ -n "$p" ]] || return 1
+  printf '%s' "$p"
+}
+mysql_exec(){
+  local q="$1" p
+  simulated && return 0
+  p="$(mysql_root_password)" || die "$EXIT_DEPENDENCY" "cannot locate the existing MySQL root credential; add MYSQL_ROOT_PASSWORD to /etc/hosting-platform/mysql.env (mode 0600) and retry"
+  docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$p" -e "$q"
+}
 
 create_account(){
   local a="$1" domain="$2"; shift 2; local profile=generic aliases= memory=768m cpus=1.5 pids=150 disk=10G bandwidth=100G upload=120M php_mem=512M php_exec=120 source_writable=1 auto_ssl=0 genpass=1 supplied= dry=0 letsencrypt_email=
