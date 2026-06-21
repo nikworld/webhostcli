@@ -447,7 +447,7 @@ install_cmd(){ local bootstrap=0 adopt=0 repair=0; while (($#)); do case "$1" in
  ensure_webhostcli_dependencies; load_platform; mkdirs; init_db; write_templates; install_units; if [[ -f "$(path /etc/hosting-platform/accounts.tsv)" ]]; then import_existing; fi
  if [[ "$(readlink -f "$0")" != "$(readlink -f "$BIN" 2>/dev/null || true)" ]]; then install -D -m 0750 "$0" "$BIN"; fi; printf '%s\n' "$VERSION" >"$LIB/version"; audit '' install success; note "WebhostCLI $VERSION installed. Run: sudo webhostcli doctor"; }
 uninstall_cmd(){ local purge=0; [[ "${1:-}" == --purge-all ]] && purge=1; require_root; if ((purge)); then [[ "${WEBHOSTCLI_CONFIRM_PURGE:-}" == DESTROY_HOSTING_DATA ]] || die 2 'set WEBHOSTCLI_CONFIRM_PURGE=DESTROY_HOSTING_DATA to purge all hosting data'; rm -rf -- "$CUSTOMER_ROOT" "$SRV/backups" "$DB"; fi; [[ -n "$ROOT" ]] || systemctl disable --now webhostcli-metrics.timer 2>/dev/null || true; rm -f "$BIN" "$(path /etc/systemd/system/webhostcli-metrics.service)" "$(path /etc/systemd/system/webhostcli-metrics.timer)"; rm -rf -- "$LIB" "$ETC"; note 'WebhostCLI management components removed; hosting infrastructure was preserved.'; }
-upgrade_cmd(){ local source="$1"; [[ -f "$source" ]] || die 3 'upgrade source not found'; bash "$source" install --repair; }
+upgrade_cmd(){ local source="${1:-}"; [[ -n "$source" ]] || die "$EXIT_USAGE" 'usage: webhostcli upgrade /path/to/new/webhostcli'; [[ -f "$source" ]] || die "$EXIT_NOT_FOUND" 'upgrade source not found'; bash "$source" install --repair; }
 
 interactive(){ while true; do cat <<'EOF'
 
