@@ -14,7 +14,17 @@ sudo webhostcli doctor
 sudo webhostcli account import-existing
 ```
 
-The installer detects `/etc/hosting-platform/bootstrap.complete` plus `platform.env`, backs up only WebhostCLI-managed material, imports the old TSV registry idempotently, and reuses the configured Docker/MySQL/Nginx/phpMyAdmin networks, image, ports, and identities. It does not reset UFW, recreate MySQL, change root credentials, or delete customer data.
+The installer detects `/etc/hosting-platform/bootstrap.complete` plus `platform.env`, installs only missing WebhostCLI prerequisites (`sqlite3` and `python3`), imports the old TSV registry idempotently, and reuses the configured Docker/MySQL/Nginx/phpMyAdmin networks, image, ports, and identities. It does not reset UFW, recreate MySQL, change root credentials, or delete customer data.
+
+If you are using an older downloaded copy that stops with `sqlite3 is required`, install the missing local packages once and rerun the installer:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y sqlite3 python3
+sudo bash webhostcli install
+```
+
+Current versions perform this limited dependency check automatically.
 
 For a truly new server, the explicit acknowledgement is required:
 
@@ -33,48 +43,50 @@ Each account gets its own UID/GID, Compose project, Nginx/PHP/SFTP/cron containe
 There are no Laravel, WordPress, CodeIgniter, or framework profiles. Every new account uses the same universal PHP runtime. It includes PHP 8.4 FPM and common extensions (PDO MySQL, mysqli, OPcache, PCNTL, bcmath, intl, zip, gd, Redis, Imagick), plus Composer, Git, Bash, Node.js, and npm. Plain PHP runs from `app/public_html` immediately. An account owner can use the isolated shell to install or maintain any framework without needing host root access:
 
 ```bash
-sudo webhostcli shell client01
+sudo webhostcli login client01
 # then, as the account UID in its own PHP container:
 composer create-project laravel/laravel .
 rm -rf public_html && ln -s public public_html
 php artisan migrate --force
 ```
 
-For non-interactive work, pass the command after the account name, for example `sudo webhostcli shell client01 php -v` or `sudo webhostcli composer client01 install`. The app volume is writable by the account UID so Composer/npm/framework installers can work; Nginx mounts it read-only.
+For non-interactive work, pass the command after the account name, for example `sudo webhostcli login client01 php -v`. The app volume is writable by the account UID so Composer/npm/framework installers can work; Nginx mounts it read-only.
 
 The state database is SQLite at `/var/lib/webhostcli/webhostcli.db` (0600). Passwords are root-only files in `/etc/webhostcli/secrets`; they are never stored in SQLite or audit events. Nginx checks are performed before reloads; configuration and account changes are locked with `flock`. Containers reduce blast radius but are not equivalent to VM isolation: kernel and daemon compromise remain host-level risks.
 
 The layout is `/usr/local/lib/webhostcli` (templates/helpers/migrations), `/etc/webhostcli` (configuration, secrets, sites), `/var/lib/webhostcli` (database, locks, metric cursors), `/var/log/webhostcli`, and `/srv/hosting` (customers, backups, shared/suspended content).
 
-## Common examples
+## Everyday use
 
 ```bash
-# Generic PHP account
-sudo webhostcli account create client01 example.com --profile generic \
-  --alias www.example.com --memory 768m --cpus 1.5 --disk 10G --bandwidth 100G
+# 1. Create the website container
+sudo webhostcli account create client01 example.com
 
-# Install any framework from the isolated account shell
-sudo webhostcli shell client01
-composer create-project codeigniter4/appstarter .
+# 2. Log in as the website user
+sudo webhostcli login client01
 
-# SFTP / private phpMyAdmin
-sudo webhostcli sftp show client01
-ssh -L 9090:127.0.0.1:9090 ADMIN_USER@SERVER_IP
+# 3. Install any application inside the container
+composer create-project laravel/laravel .
+rm -rf public_html && ln -s public public_html
+exit
+
+# 4. Basic operations
+sudo webhostcli account list
+sudo webhostcli account stop client01
+sudo webhostcli account start client01
 ```
 
-SFTP uses the account name, its allocated public port, generated credential, a chroot, and no shell/forwarding. Retrieve a secret only as root using `webhostcli account credentials ACCOUNT`. phpMyAdmin is intentionally available only through the SSH tunnel above.
+This is the normal workflow. The container already has PHP, Composer, Git, Node.js, npm, and common PHP extensions. The user decides which application to install.
 
-## Command reference
+SFTP is available when needed: `sudo webhostcli sftp show client01`. Retrieve generated root-only credentials with `sudo webhostcli account credentials client01`. phpMyAdmin stays private: `ssh -L 9090:127.0.0.1:9090 ADMIN_USER@SERVER_IP`.
+
+## Simple command reference
 
 | Area | Commands |
 |---|---|
-| Accounts | `list [--json]`, `show ACCOUNT [--json]`, `create ACCOUNT DOMAIN [options]`, `start`, `stop`, `restart`, `suspend [--reason TEXT]`, `unsuspend`, `suspend-web`, `unsuspend-web`, `suspend-sftp`, `unsuspend-sftp`, `suspend-database`, `unsuspend-database`, `credentials`, `repair`, `verify`, `logs`, `containers`, `delete [--backup\|--permanent]`, `import-existing` |
-| Domains / SSL | `domain list|show|check|alias-add|alias-remove|primary-change`; `ssl issue|status|renew|renew-all|revoke` |
-| SFTP / database | `sftp show|enable|disable|password-reset|sessions`; `database show|size|password-reset|export|import|create-extra|list|drop-extra` |
-| Usage / limits | `usage all|current|live|disk|bandwidth|database|report|top|rebuild`; `limits show|set|policy` |
-| Backups | `backup create|create-all|list|verify|restore|delete|schedule` |
-| Apps / jobs | `shell ACCOUNT [COMMAND…]`; `composer ACCOUNT install|update|audit`; `php info|restart|config-show|config-set`; `cron list|add|remove|enable|disable|logs` |
-| Operations | `logs activity|errors|nginx|php|sftp|database|collector|tail`; `service status|restart|health`; `server info|status|ports|updates|update-security|docker-usage`; `security audit|status|blocked-ips|unblock-ip|scan|scan-all|permissions` |
+| Website | `account create ACCOUNT DOMAIN`, `login ACCOUNT`, `account list`, `account start ACCOUNT`, `account stop ACCOUNT`, `account restart ACCOUNT` |
+| Removal | `account delete ACCOUNT`; permanent deletion additionally requires explicit confirmation |
+| Optional admin tools | `sftp`, `database`, `backup`, `domain`, `ssl`, `usage`, `logs`, `security`, and `doctor` |
 
 Use `--json` for supported read commands (account list/show, usage, service/server status, security audit, backup list). Exit codes are 0 success, 1 failure, 2 usage, 3 missing resource, 4 validation, 5 conflict, 6 dependency/service, and 7 permission.
 

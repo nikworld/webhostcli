@@ -451,43 +451,42 @@ upgrade_cmd(){ local source="$1"; [[ -f "$source" ]] || die 3 'upgrade source no
 
 interactive(){ while true; do cat <<'EOF'
 
-WebhostCLI Hosting Manager
+WebhostCLI
 
-1. Accounts
-2. Domains and Aliases
-3. SFTP
-4. Databases
-5. SSL Certificates
-6. Resource Usage
-7. Limits and Quotas
-8. Backups and Restore
-9. PHP and Applications
-10. Cron and Queue Workers
-11. Services
-12. Logs
-13. Security
-14. Server Information
-15. Settings
-16. System Doctor
+1. Create account
+2. Log in to account container
+3. List accounts
+4. Start account
+5. Stop account
+6. Delete account
+7. System check
 0. Exit
 EOF
- read -r -p 'Select: ' n; case "$n" in 1) list_accounts;; 14) server_cmd status;; 16) doctor;; 0) return;; *) echo 'Use direct commands for this module; see: webhostcli help';; esac; done; }
+ read -r -p 'Select: ' n; case "$n" in
+  1) read -r -p 'Account name: ' a; read -r -p 'Domain: ' d; create_account "$a" "$d";;
+  2) read -r -p 'Account name: ' a; shell_cmd "$a";;
+  3) list_accounts;; 4) read -r -p 'Account name: ' a; account_service start "$a";;
+  5) read -r -p 'Account name: ' a; account_service stop "$a";;
+  6) read -r -p 'Account name: ' a; echo "Deletion is protected. Review: webhostcli account delete $a";;
+  7) doctor;; 0) return;; *) echo 'Choose a number from the menu.';; esac; done; }
 help(){ cat <<'EOF'
 WebhostCLI 1.0.0
-Usage: webhostcli <module> <command> [options]
+The normal workflow is deliberately small:
 
-Core: install [--bootstrap|--adopt-existing|--repair], upgrade FILE, uninstall [--purge-all], doctor, version
-Accounts: account list|show|create|start|stop|restart|suspend|unsuspend|suspend-web|unsuspend-web|suspend-sftp|unsuspend-sftp|suspend-database|unsuspend-database|credentials|repair|verify|logs|containers|delete|import-existing
-Domains: domain list|show|check|alias-add|alias-remove|primary-change
-SFTP: sftp show|enable|disable|password-reset|sessions ACCOUNT
-Database: database show|size|password-reset|export|import|create-extra|list|drop-extra ACCOUNT
-SSL: ssl issue|status|renew|renew-all|revoke ACCOUNT
-Monitoring: usage all|current|live|disk|bandwidth|database|report|top|rebuild; limits show|set|policy
-Backups: backup create|create-all|list|verify|restore|delete|schedule
-Applications: shell ACCOUNT [COMMAND...], composer ACCOUNT install|update|audit; php info|restart|config-show|config-set
-Other: cron ..., logs ..., service ..., server ..., security ...
+  webhostcli account create ACCOUNT DOMAIN
+  webhostcli login ACCOUNT
+  webhostcli account list
+  webhostcli account start|stop|restart ACCOUNT
+  webhostcli account delete ACCOUNT
 
-Use --json on supported read commands. Secrets are shown only by `account credentials ACCOUNT` to root.
+`login` opens an isolated shell in that account's PHP container as its own UID.
+The container already has PHP, Composer, Git, Node.js, npm, common PHP extensions,
+and a private MySQL database connection. Install Laravel, CodeIgniter, WordPress,
+or a plain PHP application from that shell.
+
+Administration: install [--bootstrap|--adopt-existing|--repair], doctor, version,
+backup, logs, usage, security, domain, ssl, database, and sftp remain available for
+server administrators. Run `webhostcli help` after an administrator command for details.
 EOF
 }
 main(){ local first="${1:-}"; case "$first" in install) shift; install_cmd "$@"; return;; upgrade) shift; upgrade_cmd "$@"; return;; uninstall) shift; uninstall_cmd "$@"; return;; version|--version) echo "$VERSION"; return;; help|-h|--help) help; return;; esac
@@ -496,5 +495,5 @@ main(){ local first="${1:-}"; case "$first" in install) shift; install_cmd "$@";
  doctor) doctor;; metrics-collect) collect_metrics;;
  account) shift; local sub="${1:-}"; shift || true; case "$sub" in list) [[ "${1:-}" == --json ]] && JSON=true; list_accounts;; show) local a="$1"; [[ "${2:-}" == --json ]] && JSON=true; show_account "$a";; create) create_account "$@";; start|stop|restart) account_service "$sub" "$1";; suspend|unsuspend|suspend-web|unsuspend-web|suspend-sftp|unsuspend-sftp|suspend-database|unsuspend-database) local mode=full; case "$sub" in *-web) mode=web;; *-sftp) mode=sftp;; *-database) mode=database;; esac; local reason=; [[ "${2:-}" == --reason ]] && reason="$3"; [[ "$sub" == suspend* ]] && suspend_account "$1" "$mode" "$reason" || unsuspend_account "$1" "$mode";; credentials) check_account "$1"; require_root; echo "SFTP username: $1"; echo "SFTP password: $(read_secret "$1" SFTP_PASSWORD)"; echo "Database password: $(read_secret "$1" DB_PASSWORD)";; repair) check_account "$1"; render_account "$1"; nginx_test_reload; compose "$1" up -d;; verify) check_account "$1"; compose "$1" config; [[ -f "$ETC/nginx/$1.conf" ]] || die 6 'missing nginx config'; echo OK;; logs) logs_cmd tail "$1";; containers) check_account "$1"; compose "$1" ps;; import-existing) import_existing;; delete) local a="$1"; check_account "$a"; [[ "${2:-}" == --permanent ]] && { [[ "${WEBHOSTCLI_CONFIRM_DELETE:-}" == "$a" ]] || die 2 "set WEBHOSTCLI_CONFIRM_DELETE=$a to confirm permanent deletion"; compose "$a" down; rm -rf -- "$(account_dir "$a")"; db "DELETE FROM accounts WHERE account='$(sql_escape "$a")';"; } || { echo "Deletion summary for $a:"; show_account "$a"; echo "Set WEBHOSTCLI_CONFIRM_DELETE=$a then rerun with --permanent to delete."; };;
  *) die 2 'unknown account command';; esac;;
- domain) shift; domain_cmd "$@";; ssl) shift; ssl_cmd "$@";; sftp) shift; sftp_cmd "$@";; database) shift; database_cmd "$@";; usage) shift; usage_cmd "$@";; limits) shift; limits_cmd "$@";; backup) shift; backup_cmd "$@";; php) shift; php_cmd "$@";; shell) shift; shell_cmd "$@";; composer) shift; composer_cmd "$@";; cron) shift; cron_cmd "$@";; logs) shift; logs_cmd "$@";; service) shift; service_cmd "$@";; server) shift; server_cmd "$@";; security) shift; security_cmd "$@";; *) die 2 "unknown command: $first (run: webhostcli help)";; esac; }
+ domain) shift; domain_cmd "$@";; ssl) shift; ssl_cmd "$@";; sftp) shift; sftp_cmd "$@";; database) shift; database_cmd "$@";; usage) shift; usage_cmd "$@";; limits) shift; limits_cmd "$@";; backup) shift; backup_cmd "$@";; php) shift; php_cmd "$@";; login|shell) shift; shell_cmd "$@";; composer) shift; composer_cmd "$@";; cron) shift; cron_cmd "$@";; logs) shift; logs_cmd "$@";; service) shift; service_cmd "$@";; server) shift; server_cmd "$@";; security) shift; security_cmd "$@";; *) die 2 "unknown command: $first (run: webhostcli help)";; esac; }
 main "$@"
