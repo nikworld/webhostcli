@@ -81,6 +81,14 @@ INSERT INTO schema_migrations VALUES(1,datetime("now")); COMMIT;'
 }
 
 account_exists(){ [[ "$(dbq "SELECT count(*) FROM accounts WHERE account='$(sql_escape "$1")';")" != 0 ]]; }
+purge_account_state(){
+  local a="$1" q="$(sql_escape "$1")"
+  db "BEGIN;
+DELETE FROM bandwidth_monthly WHERE account='$q'; DELETE FROM bandwidth_daily WHERE account='$q'; DELETE FROM metrics WHERE account='$q';
+DELETE FROM cron_jobs WHERE account='$q'; DELETE FROM backups WHERE account='$q'; DELETE FROM databases WHERE account='$q';
+DELETE FROM suspensions WHERE account='$q'; DELETE FROM resource_limits WHERE account='$q'; DELETE FROM ports WHERE account='$q';
+DELETE FROM domains WHERE account='$q'; DELETE FROM accounts WHERE account='$q'; COMMIT;"
+}
 get_field(){ dbq "SELECT $2 FROM $1 WHERE account='$(sql_escape "$3")';"; }
 account_dir(){ printf '%s/%s' "$CUSTOMER_ROOT" "$1"; }
 check_account(){ valid_account "$1" || die "$EXIT_VALIDATION" "invalid account name"; account_exists "$1" || die "$EXIT_NOT_FOUND" "account not found: $1"; }
@@ -233,7 +241,7 @@ create_account(){
   sftp_pass="${supplied:-$(password)}"; [[ ${#sftp_pass} -ge 12 ]] || die "$EXIT_VALIDATION" "SFTP password must be at least 12 characters"; db_pass="$(password)"; dbname="${a}_db"; user="${a}_db"; dir="$(account_dir "$a")"
   ((dry)) && { note "Would create $a ($domain), uid $uid, web $wb, SFTP $sp"; return; }
   lock global; local created=0
-  cleanup_create(){ local rc=$?; if ((rc != 0 && created)); then compose "$a" down --remove-orphans >/dev/null 2>&1 || true; rm -rf -- "$dir" "$ETC/nginx/$a.conf" "$(secret_file "$a")"; db "DELETE FROM accounts WHERE account='$(sql_escape "$a")';" >/dev/null 2>&1 || true; fi; return "$rc"; }
+  cleanup_create(){ local rc=$?; if ((rc != 0 && created)); then compose "$a" down --remove-orphans >/dev/null 2>&1 || true; rm -rf -- "$dir" "$ETC/nginx/$a.conf" "$(secret_file "$a")"; purge_account_state "$a" >/dev/null 2>&1 || true; fi; return "$rc"; }
   trap cleanup_create RETURN
   install -d -m 0750 "$dir/app/public_html" "$dir/writable" "$dir/cron" "$dir/logs"; created=1
   printf '<!doctype html><title>%s</title><h1>%s is ready</h1>\n' "$domain" "$domain" >"$dir/app/public_html/index.html"
@@ -512,7 +520,7 @@ main(){ local first="${1:-}"; case "$first" in install) shift; install_cmd "$@";
  [[ -n "$first" ]] || { init_db; load_platform; interactive; return; }; init_db; load_platform
  case "$first" in
  doctor) doctor;; metrics-collect) collect_metrics;;
- account) shift; local sub="${1:-}"; shift || true; case "$sub" in list) [[ "${1:-}" == --json ]] && JSON=true; list_accounts;; show) local a="$1"; [[ "${2:-}" == --json ]] && JSON=true; show_account "$a";; create) create_account "$@";; start|stop|restart) account_service "$sub" "$1";; suspend|unsuspend|suspend-web|unsuspend-web|suspend-sftp|unsuspend-sftp|suspend-database|unsuspend-database) local mode=full; case "$sub" in *-web) mode=web;; *-sftp) mode=sftp;; *-database) mode=database;; esac; local reason=; [[ "${2:-}" == --reason ]] && reason="$3"; [[ "$sub" == suspend* ]] && suspend_account "$1" "$mode" "$reason" || unsuspend_account "$1" "$mode";; credentials) check_account "$1"; require_root; echo "SFTP username: $1"; echo "SFTP password: $(read_secret "$1" SFTP_PASSWORD)"; echo "Database password: $(read_secret "$1" DB_PASSWORD)";; repair) check_account "$1"; render_account "$1"; nginx_test_reload; compose "$1" up -d;; verify) check_account "$1"; compose "$1" config; [[ -f "$ETC/nginx/$1.conf" ]] || die 6 'missing nginx config'; echo OK;; logs) logs_cmd tail "$1";; containers) check_account "$1"; compose "$1" ps;; import-existing) import_existing;; delete) local a="$1"; check_account "$a"; [[ "${2:-}" == --permanent ]] && { [[ "${WEBHOSTCLI_CONFIRM_DELETE:-}" == "$a" ]] || die 2 "set WEBHOSTCLI_CONFIRM_DELETE=$a to confirm permanent deletion"; compose "$a" down; rm -rf -- "$(account_dir "$a")"; db "DELETE FROM accounts WHERE account='$(sql_escape "$a")';"; } || { echo "Deletion summary for $a:"; show_account "$a"; echo "Set WEBHOSTCLI_CONFIRM_DELETE=$a then rerun with --permanent to delete."; };;
+ account) shift; local sub="${1:-}"; shift || true; case "$sub" in list) [[ "${1:-}" == --json ]] && JSON=true; list_accounts;; show) local a="$1"; [[ "${2:-}" == --json ]] && JSON=true; show_account "$a";; create) create_account "$@";; start|stop|restart) account_service "$sub" "$1";; suspend|unsuspend|suspend-web|unsuspend-web|suspend-sftp|unsuspend-sftp|suspend-database|unsuspend-database) local mode=full; case "$sub" in *-web) mode=web;; *-sftp) mode=sftp;; *-database) mode=database;; esac; local reason=; [[ "${2:-}" == --reason ]] && reason="$3"; [[ "$sub" == suspend* ]] && suspend_account "$1" "$mode" "$reason" || unsuspend_account "$1" "$mode";; credentials) check_account "$1"; require_root; echo "SFTP username: $1"; echo "SFTP password: $(read_secret "$1" SFTP_PASSWORD)"; echo "Database password: $(read_secret "$1" DB_PASSWORD)";; repair) check_account "$1"; render_account "$1"; nginx_test_reload; compose "$1" up -d;; verify) check_account "$1"; compose "$1" config; [[ -f "$ETC/nginx/$1.conf" ]] || die 6 'missing nginx config'; echo OK;; logs) logs_cmd tail "$1";; containers) check_account "$1"; compose "$1" ps;; import-existing) import_existing;; delete) local a="$1"; check_account "$a"; [[ "${2:-}" == --permanent ]] && { [[ "${WEBHOSTCLI_CONFIRM_DELETE:-}" == "$a" ]] || die 2 "set WEBHOSTCLI_CONFIRM_DELETE=$a to confirm permanent deletion"; compose "$a" down; rm -rf -- "$(account_dir "$a")"; purge_account_state "$a"; } || { echo "Deletion summary for $a:"; show_account "$a"; echo "Set WEBHOSTCLI_CONFIRM_DELETE=$a then rerun with --permanent to delete."; };;
  *) die 2 'unknown account command';; esac;;
  domain) shift; domain_cmd "$@";; ssl) shift; ssl_cmd "$@";; sftp) shift; sftp_cmd "$@";; database) shift; database_cmd "$@";; usage) shift; usage_cmd "$@";; limits) shift; limits_cmd "$@";; backup) shift; backup_cmd "$@";; php) shift; php_cmd "$@";; login|shell) shift; shell_cmd "$@";; composer) shift; composer_cmd "$@";; cron) shift; cron_cmd "$@";; logs) shift; logs_cmd "$@";; service) shift; service_cmd "$@";; server) shift; server_cmd "$@";; security) shift; security_cmd "$@";; *) die 2 "unknown command: $first (run: webhostcli help)";; esac; }
 main "$@"
