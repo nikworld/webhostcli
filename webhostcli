@@ -112,7 +112,9 @@ services:
     mem_limit: {{MEMORY}}
     cpus: "{{CPUS}}"
     ports: ["127.0.0.1:{{WEB_PORT}}:8080"]
-    tmpfs: [/var/cache/nginx:rw,noexec,nosuid,size=32m, /var/run:rw,noexec,nosuid,size=8m]
+    tmpfs:
+      - "/var/cache/nginx:rw,noexec,nosuid,size=32m"
+      - "/var/run:rw,noexec,nosuid,size=8m"
     volumes: ["./app:/var/www/app:ro", "./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro"]
     networks: [web,runtime]
   php:
@@ -124,7 +126,8 @@ services:
     pids_limit: {{PIDS}}
     mem_limit: {{MEMORY}}
     cpus: "{{CPUS}}"
-    tmpfs: [/tmp:rw,noexec,nosuid,size=128m]
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,size=128m"
     volumes: ["./app:/var/www/app:rw", "./writable:/var/www/writable:rw"]
     networks: [runtime,db]
   sftp:
@@ -533,7 +536,7 @@ main(){ local first="${1:-}"; case "$first" in install) shift; install_cmd "$@";
  [[ -n "$first" ]] || { init_db; load_platform; interactive; return; }; init_db; load_platform
  case "$first" in
  doctor) doctor;; metrics-collect) collect_metrics;;
- account) shift; local sub="${1:-}"; shift || true; case "$sub" in list) [[ "${1:-}" == --json ]] && JSON=true; list_accounts;; show) local a="$1"; [[ "${2:-}" == --json ]] && JSON=true; show_account "$a";; create) create_account "$@";; start|stop|restart) account_service "$sub" "$1";; suspend|unsuspend|suspend-web|unsuspend-web|suspend-sftp|unsuspend-sftp|suspend-database|unsuspend-database) local mode=full; case "$sub" in *-web) mode=web;; *-sftp) mode=sftp;; *-database) mode=database;; esac; local reason=; [[ "${2:-}" == --reason ]] && reason="$3"; [[ "$sub" == suspend* ]] && suspend_account "$1" "$mode" "$reason" || unsuspend_account "$1" "$mode";; credentials) check_account "$1"; require_root; echo "SFTP username: $1"; echo "SFTP password: $(read_secret "$1" SFTP_PASSWORD)"; echo "Database password: $(read_secret "$1" DB_PASSWORD)";; repair) check_account "$1"; render_account "$1"; nginx_test_reload; compose "$1" up -d;; verify) check_account "$1"; compose "$1" config; [[ -f "$ETC/nginx/$1.conf" ]] || die 6 'missing nginx config'; echo OK;; logs) logs_cmd tail "$1";; containers) check_account "$1"; compose "$1" ps;; import-existing) import_existing;; delete) local a="$1"; check_account "$a"; [[ "${2:-}" == --permanent ]] && { [[ "${WEBHOSTCLI_CONFIRM_DELETE:-}" == "$a" ]] || die 2 "set WEBHOSTCLI_CONFIRM_DELETE=$a to confirm permanent deletion"; compose "$a" down; rm -rf -- "$(account_dir "$a")"; purge_account_state "$a"; } || { echo "Deletion summary for $a:"; show_account "$a"; echo "Set WEBHOSTCLI_CONFIRM_DELETE=$a then rerun with --permanent to delete."; };;
+ account) shift; local sub="${1:-}"; shift || true; case "$sub" in list) [[ "${1:-}" == --json ]] && JSON=true; list_accounts;; show) local a="$1"; [[ "${2:-}" == --json ]] && JSON=true; show_account "$a";; create) create_account "$@";; start|stop|restart) account_service "$sub" "$1";; suspend|unsuspend|suspend-web|unsuspend-web|suspend-sftp|unsuspend-sftp|suspend-database|unsuspend-database) local mode=full; case "$sub" in *-web) mode=web;; *-sftp) mode=sftp;; *-database) mode=database;; esac; local reason=; [[ "${2:-}" == --reason ]] && reason="$3"; [[ "$sub" == suspend* ]] && suspend_account "$1" "$mode" "$reason" || unsuspend_account "$1" "$mode";; credentials) check_account "$1"; require_root; echo "SFTP username: $1"; echo "SFTP password: $(read_secret "$1" SFTP_PASSWORD)"; echo "Database password: $(read_secret "$1" DB_PASSWORD)";; repair) check_account "$1"; render_account "$1"; nginx_test_reload; compose "$1" up -d;; verify) check_account "$1"; compose "$1" config; [[ -f "$ETC/nginx/$1.conf" ]] || die 6 'missing nginx config'; echo OK;; logs) logs_cmd tail "$1";; containers) check_account "$1"; compose "$1" ps;; import-existing) import_existing;; delete) local a="$1"; check_account "$a"; [[ "${2:-}" == --permanent ]] && { [[ "${WEBHOSTCLI_CONFIRM_DELETE:-}" == "$a" ]] || die 2 "set WEBHOSTCLI_CONFIRM_DELETE=$a to confirm permanent deletion"; compose "$a" down || true; rm -rf -- "$(account_dir "$a")"; purge_account_state "$a"; } || { echo "Deletion summary for $a:"; show_account "$a"; echo "Set WEBHOSTCLI_CONFIRM_DELETE=$a then rerun with --permanent to delete."; };;
  *) die 2 'unknown account command';; esac;;
  domain) shift; domain_cmd "$@";; ssl) shift; ssl_cmd "$@";; sftp) shift; sftp_cmd "$@";; database) shift; database_cmd "$@";; usage) shift; usage_cmd "$@";; limits) shift; limits_cmd "$@";; backup) shift; backup_cmd "$@";; php) shift; php_cmd "$@";; login|shell) shift; shell_cmd "$@";; composer) shift; composer_cmd "$@";; cron) shift; cron_cmd "$@";; logs) shift; logs_cmd "$@";; service) shift; service_cmd "$@";; server) shift; server_cmd "$@";; security) shift; security_cmd "$@";; *) die 2 "unknown command: $first (run: webhostcli help)";; esac; }
 main "$@"
