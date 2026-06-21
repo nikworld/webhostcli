@@ -208,7 +208,7 @@ nginx_test_reload(){
 }
 compose(){ local a="$1"; shift; simulated && return 0; docker compose -p "whc_$a" -f "$(account_dir "$a")/compose.yaml" "$@"; }
 mysql_root_password(){
-  local f p
+  local f p secret_file
   # Support both WebhostCLI's fresh-install layout and common legacy bootstrap layouts.
   for f in "$(path /etc/hosting-platform/mysql.env)" "$(path /srv/hosting/database/.env)" "$(path /srv/hosting/database/mysql.env)"; do
     [[ -r "$f" ]] || continue
@@ -218,13 +218,26 @@ mysql_root_password(){
   # Docker keeps the configured environment on the existing container. This is read
   # only by root and is never echoed, logged, or saved by WebhostCLI.
   p="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$MYSQL_CONTAINER" 2>/dev/null | sed -n 's/^MYSQL_ROOT_PASSWORD=//p' | head -n 1 || true)"
-  [[ -n "$p" ]] || return 1
-  printf '%s' "$p"
+  [[ -n "$p" ]] && { printf '%s' "$p"; return 0; }
+  # Compose/Swarm deployments often keep it in a mounted Docker secret instead.
+  secret_file="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$MYSQL_CONTAINER" 2>/dev/null | sed -n 's/^MYSQL_ROOT_PASSWORD_FILE=//p' | head -n 1 || true)"
+  if [[ -n "$secret_file" ]]; then
+    p="$(docker exec "$MYSQL_CONTAINER" sh -c 'cat -- "$1"' sh "$secret_file" 2>/dev/null || true)"
+    [[ -n "$p" ]] && { printf '%s' "$p"; return 0; }
+  fi
+  return 1
 }
 mysql_exec(){
   local q="$1" p
   simulated && return 0
-  p="$(mysql_root_password)" || die "$EXIT_DEPENDENCY" "cannot locate the existing MySQL root credential; add MYSQL_ROOT_PASSWORD to /etc/hosting-platform/mysql.env (mode 0600) and retry"
+  if ! p="$(mysql_root_password)"; then
+    # Some hardened bootstrap stacks permit local root access inside the DB container.
+    if docker exec -i "$MYSQL_CONTAINER" mysql -uroot -e 'SELECT 1' >/dev/null 2>&1; then
+      docker exec -i "$MYSQL_CONTAINER" mysql -uroot -e "$q"
+      return
+    fi
+    die "$EXIT_DEPENDENCY" "cannot locate the existing MySQL root credential; add MYSQL_ROOT_PASSWORD to /etc/hosting-platform/mysql.env (mode 0600) and retry"
+  fi
   docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$p" -e "$q"
 }
 
