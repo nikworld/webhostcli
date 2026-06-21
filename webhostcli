@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+# webhostcli - single-server, container-isolated hosting management
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 027
+
+VERSION="1.0.0"
+EXIT_USAGE=2 EXIT_NOT_FOUND=3 EXIT_VALIDATION=4 EXIT_CONFLICT=5 EXIT_DEPENDENCY=6 EXIT_PERMISSION=7
+ROOT="${WEBHOSTCLI_ROOT:-}"
+[[ -z "$ROOT" || "$ROOT" == /* ]] || { echo "WEBHOSTCLI_ROOT must be absolute" >&2; exit "$EXIT_VALIDATION"; }
+path() { if [[ -n "$ROOT" ]]; then printf '%s%s' "$ROOT" "$1"; else printf '%s' "$1"; fi; }
+BIN="$(path /usr/local/bin/webhostcli)"; LIB="$(path /usr/local/lib/webhostcli)"; ETC="$(path /etc/webhostcli)"
+VAR="$(path /var/lib/webhostcli)"; LOG="$(path /var/log/webhostcli)"; SRV="$(path /srv/hosting)"
+DB="$VAR/webhostcli.db"; LOCKDIR="$VAR/locks"; CUSTOMER_ROOT="$SRV/customers"; SECRETS="$ETC/secrets"
+PLATFORM_ENV="$(path /etc/hosting-platform/platform.env)"; BOOTSTRAP_MARKER="$(path /etc/hosting-platform/bootstrap.complete)"
+JSON=false DRY_RUN=false QUIET=false
+
+die(){ local code="$1"; shift; printf 'webhostcli: %s\n' "$*" >&2; exit "$code"; }
+note(){ $QUIET || printf '%s\n' "$*"; }
+require_root(){ [[ $EUID -eq 0 || -n "$ROOT" ]] || die "$EXIT_PERMISSION" "run this command with sudo"; }
+simulated(){ [[ -n "$ROOT" || "${WEBHOSTCLI_TEST_MODE:-}" == 1 ]]; }
+cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
+run(){ if $DRY_RUN; then note "+ $*"; else "$@"; fi; }
+now(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+administrator(){ printf '%s' "${SUDO_USER:-${USER:-root}}"; }
+mkdirs(){ install -d -m 0750 "$LIB/templates" "$LIB/helpers" "$LIB/migrations" "$ETC/nginx" "$ETC/policies" "$SECRETS" "$VAR/metrics" "$VAR/cursors" "$VAR/state" "$LOCKDIR" "$LOG" "$SRV/backups" "$SRV/suspended-page" "$CUSTOMER_ROOT"; chmod 0700 "$SECRETS" "$LOCKDIR"; }
+audit(){ local account="${1:-}" action="${2:-}" result="${3:-success}" reason="${4:-}"; mkdir -p "$LOG"; python3 - "$LOG/audit.log" "$(now)" "$(administrator)" "${0##*/} ${*}" "$account" "$action" "$result" "$reason" <<'PY'
+import json,sys
+p,t,a,c,acct,action,result,reason=sys.argv[1:]
+with open(p,'a',encoding='utf-8') as f:f.write(json.dumps({'timestamp':t,'administrator':a,'command':c,'account':acct,'action':action,'result':result,'reason':reason},separators=(',',':'))+'\n')
+PY
+}
+lock(){ local name="$1"; mkdir -p "$LOCKDIR"; exec 9>"$LOCKDIR/${name}.lock"; flock -n 9 || die "$EXIT_CONFLICT" "another $name operation is already running"; }
+valid_account(){ [[ "$1" =~ ^[a-z][a-z0-9_-]{1,30}$ ]] && [[ "$1" != *..* ]]; }
+valid_domain(){ [[ "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] && [[ ${#1} -le 253 ]]; }
+safe_path(){ local x="$1"; [[ -n "$x" && "$x" == "$CUSTOMER_ROOT"/* && "$x" != "$CUSTOMER_ROOT" && "$x" != / && "$x" != /srv/hosting ]]; }
+bytes(){ numfmt --from=iec "$1" 2>/dev/null || printf '%s' "$1"; }
+human(){ numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || printf '%sB' "$1"; }
+
+load_platform(){
+  MYSQL_CONTAINER=hosting-mysql; DB_NETWORK=hosting_db_core; PMA_CONTAINER=hosting-phpmyadmin; PMA_LOOPBACK_PORT=9090
+  PHP_RUNTIME_IMAGE=local/secure-hosting-php:8.4; WEB_PORT_START=8101; WEB_PORT_END=8999
+  SFTP_PUBLIC_PORT_START=22001; SFTP_PUBLIC_PORT_END=22999; SFTP_BACKEND_PORT_START=32001; SFTP_BACKEND_PORT_END=32999
+  CUSTOMER_UID_START=10001; CUSTOMER_UID_END=59999
+  if [[ -f "$PLATFORM_ENV" ]]; then
+    # Only accept simple KEY=VALUE lines for the known contract; this avoids executing configuration as code.
+    local k v
+    while IFS='=' read -r k v; do
+      [[ "$k" =~ ^(MYSQL_CONTAINER|DB_NETWORK|PMA_CONTAINER|PMA_LOOPBACK_PORT|PHP_RUNTIME_IMAGE|WEB_PORT_START|WEB_PORT_END|SFTP_PUBLIC_PORT_START|SFTP_PUBLIC_PORT_END|SFTP_BACKEND_PORT_START|SFTP_BACKEND_PORT_END|CUSTOMER_UID_START|CUSTOMER_UID_END)$ ]] || continue
+      [[ "$v" =~ ^[A-Za-z0-9._:/-]+$ ]] || die "$EXIT_VALIDATION" "unsafe value in platform.env: $k"
+      printf -v "$k" '%s' "$v"
+    done < <(grep -E '^[A-Z_]+=' "$PLATFORM_ENV" || true)
+  fi
+  [[ "$WEB_PORT_START" =~ ^[0-9]+$ && "$WEB_PORT_END" =~ ^[0-9]+$ && "$WEB_PORT_START" -le "$WEB_PORT_END" ]] || die "$EXIT_VALIDATION" "invalid web port range"
+}
+
+db(){ sqlite3 -batch -bail "$DB" "$@"; }
+dbq(){ sqlite3 -batch -bail -noheader "$DB" "$@"; }
+sql_escape(){ printf '%s' "$1" | sed "s/'/''/g"; }
+init_db(){
+  cmd_exists sqlite3 || die "$EXIT_DEPENDENCY" "sqlite3 is required"
+  mkdir -p "$VAR"; chmod 0700 "$VAR"
+  db 'PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);' >/dev/null
+  if [[ "$(dbq 'SELECT count(*) FROM schema_migrations WHERE version=1;')" == 0 ]]; then
+    db 'BEGIN;
+CREATE TABLE accounts(account TEXT PRIMARY KEY, primary_domain TEXT NOT NULL UNIQUE, uid INTEGER NOT NULL UNIQUE, profile TEXT NOT NULL DEFAULT "generic", status TEXT NOT NULL DEFAULT "active", created_at TEXT NOT NULL, source_writable INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE domains(domain TEXT PRIMARY KEY, account TEXT NOT NULL REFERENCES accounts(account) ON DELETE CASCADE, kind TEXT NOT NULL CHECK(kind IN("primary","alias")));
+CREATE TABLE ports(account TEXT PRIMARY KEY REFERENCES accounts(account) ON DELETE CASCADE, web_backend INTEGER NOT NULL UNIQUE, sftp_public INTEGER NOT NULL UNIQUE, sftp_backend INTEGER NOT NULL UNIQUE);
+CREATE TABLE resource_limits(account TEXT PRIMARY KEY REFERENCES accounts(account) ON DELETE CASCADE, memory TEXT NOT NULL, cpus TEXT NOT NULL, pids INTEGER NOT NULL, disk_bytes INTEGER NOT NULL, bandwidth_bytes INTEGER NOT NULL, php_memory TEXT NOT NULL, php_execution INTEGER NOT NULL, disk_action TEXT NOT NULL DEFAULT "warn", bandwidth_action TEXT NOT NULL DEFAULT "warn");
+CREATE TABLE suspensions(account TEXT PRIMARY KEY REFERENCES accounts(account) ON DELETE CASCADE, full_suspended INTEGER NOT NULL DEFAULT 0, web_suspended INTEGER NOT NULL DEFAULT 0, sftp_suspended INTEGER NOT NULL DEFAULT 0, database_suspended INTEGER NOT NULL DEFAULT 0, reason TEXT, suspended_at TEXT, suspended_by TEXT);
+CREATE TABLE databases(account TEXT NOT NULL REFERENCES accounts(account) ON DELETE CASCADE, name TEXT NOT NULL, username TEXT NOT NULL, PRIMARY KEY(account,name));
+CREATE TABLE backups(id TEXT PRIMARY KEY, account TEXT NOT NULL REFERENCES accounts(account), path TEXT NOT NULL, created_at TEXT NOT NULL, verified_at TEXT, schedule TEXT);
+CREATE TABLE cron_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL REFERENCES accounts(account) ON DELETE CASCADE, schedule TEXT NOT NULL, command TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE metrics(account TEXT NOT NULL REFERENCES accounts(account) ON DELETE CASCADE, sampled_at TEXT NOT NULL, cpu REAL, memory_bytes INTEGER, pids INTEGER, restarts INTEGER, disk_bytes INTEGER, database_bytes INTEGER, PRIMARY KEY(account,sampled_at));
+CREATE TABLE bandwidth_daily(account TEXT NOT NULL REFERENCES accounts(account) ON DELETE CASCADE, day TEXT NOT NULL, http_in INTEGER NOT NULL DEFAULT 0, http_out INTEGER NOT NULL DEFAULT 0, sftp_in INTEGER NOT NULL DEFAULT 0, sftp_out INTEGER NOT NULL DEFAULT 0, requests INTEGER NOT NULL DEFAULT 0, status4xx INTEGER NOT NULL DEFAULT 0, status5xx INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account,day));
+CREATE TABLE bandwidth_monthly(account TEXT NOT NULL REFERENCES accounts(account) ON DELETE CASCADE, month TEXT NOT NULL, inbound INTEGER NOT NULL DEFAULT 0, outbound INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account,month));
+CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE audit_events(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,administrator TEXT,action TEXT,account TEXT,result TEXT,reason TEXT);
+INSERT INTO schema_migrations VALUES(1,datetime("now")); COMMIT;'
+  fi
+  chmod 0600 "$DB" 2>/dev/null || true
+}
+
+account_exists(){ [[ "$(dbq "SELECT count(*) FROM accounts WHERE account='$(sql_escape "$1")';")" != 0 ]]; }
+get_field(){ dbq "SELECT $2 FROM $1 WHERE account='$(sql_escape "$3")';"; }
+account_dir(){ printf '%s/%s' "$CUSTOMER_ROOT" "$1"; }
+check_account(){ valid_account "$1" || die "$EXIT_VALIDATION" "invalid account name"; account_exists "$1" || die "$EXIT_NOT_FOUND" "account not found: $1"; }
+domain_taken(){ [[ "$(dbq "SELECT count(*) FROM domains WHERE domain='$(sql_escape "$1")';")" != 0 ]]; }
+next_free(){ local table="$1" field="$2" start="$3" end="$4" n; for ((n=start;n<=end;n++)); do [[ "$(dbq "SELECT count(*) FROM $table WHERE $field=$n;")" == 0 ]] && { printf '%s' "$n"; return; }; done; die "$EXIT_CONFLICT" "no free $field values remain"; }
+password(){ openssl rand -base64 36 | tr -d '\n' | tr '+/' 'Aa' | cut -c1-32; }
+secret_file(){ printf '%s/%s.env' "$SECRETS" "$1"; }
+write_secret(){ local account="$1" sftp="$2" dbpass="$3" tmp; tmp="$(mktemp "$SECRETS/.${account}.XXXXXX")"; printf 'SFTP_USERNAME=%q\nSFTP_PASSWORD=%q\nDB_PASSWORD=%q\n' "$account" "$sftp" "$dbpass" >"$tmp"; chmod 0600 "$tmp"; mv -f "$tmp" "$(secret_file "$account")"; }
+read_secret(){ local account="$1" key="$2"; [[ -f "$(secret_file "$account")" ]] || die "$EXIT_NOT_FOUND" "credential file is missing"; grep -E "^${key}=" "$(secret_file "$account")" | head -1 | cut -d= -f2-; }
+
+write_templates(){
+  cat >"$LIB/templates/compose.yaml.tpl" <<'EOF'
+services:
+  web:
+    image: nginx:alpine
+    user: "{{UID}}:{{UID}}"
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: {{PIDS}}
+    mem_limit: {{MEMORY}}
+    cpus: "{{CPUS}}"
+    ports: ["127.0.0.1:{{WEB_PORT}}:8080"]
+    tmpfs: [/var/cache/nginx:rw,noexec,nosuid,size=32m, /var/run:rw,noexec,nosuid,size=8m]
+    volumes: ["./app:/var/www/app:ro", "./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro"]
+    networks: [web,runtime]
+  php:
+    image: {{PHP_IMAGE}}
+    user: "{{UID}}:{{UID}}"
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: {{PIDS}}
+    mem_limit: {{MEMORY}}
+    cpus: "{{CPUS}}"
+    tmpfs: [/tmp:rw,noexec,nosuid,size=128m]
+    volumes: ["./app:/var/www/app:rw", "./writable:/var/www/writable:rw"]
+    networks: [runtime,db]
+  sftp:
+    image: atmoz/sftp:alpine
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 80
+    ports: ["127.0.0.1:{{SFTP_BACKEND}}:22"]
+    volumes: ["./app:/home/{{ACCOUNT}}/app", "./writable:/home/{{ACCOUNT}}/writable"]
+    networks: [web]
+  cron:
+    image: {{PHP_IMAGE}}
+    user: "{{UID}}:{{UID}}"
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    volumes: ["./app:/var/www/app:ro", "./writable:/var/www/writable:rw", "./cron:/etc/webhostcli-cron:ro"]
+    networks: [db]
+  db-gateway:
+    image: alpine/socat
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    command: "TCP-LISTEN:3306,fork,reuseaddr TCP:{{MYSQL_CONTAINER}}:3306"
+    networks: [db,core]
+networks:
+  web: {internal: true}
+  runtime: {internal: true}
+  db: {internal: true}
+  core: {external: true, name: {{DB_NETWORK}}}
+EOF
+  cat >"$LIB/templates/nginx.conf.tpl" <<'EOF'
+server {
+  listen 80; server_name {{DOMAINS}};
+  access_log /var/log/webhostcli/nginx/{{ACCOUNT}}.access.log webhostcli;
+  error_log /var/log/webhostcli/nginx/{{ACCOUNT}}.error.log;
+  client_max_body_size {{UPLOAD}};
+  location ~* /(?:\.git|\.env|composer\.(?:json|lock)) { deny all; }
+  location ~* /(?:uploads|wp-content/uploads)/.*\.php$ { deny all; }
+  location / { proxy_pass http://127.0.0.1:{{WEB_PORT}}; proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+}
+EOF
+  cat >"$LIB/templates/app-nginx.conf.tpl" <<'EOF'
+server {
+  listen 8080;
+  server_name _;
+  root /var/www/app/public_html;
+  index index.php index.html;
+  location / { try_files $uri $uri/ /index.php?$query_string; }
+  location ~ \.php$ {
+    try_files $uri =404;
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    fastcgi_pass php:9000;
+  }
+  location ~ /\. { deny all; }
+}
+EOF
+  cat >"$SRV/suspended-page/index.html" <<'EOF'
+<!doctype html><meta charset="utf-8"><title>Account suspended</title><h1>Account suspended</h1><p>This hosting account is temporarily unavailable. Please contact the account owner.</p>
+EOF
+}
+replace_template(){ local src="$1" dst="$2"; shift 2; cp "$src" "$dst"; while (($#)); do sed -i "s|{{$1}}|$2|g" "$dst"; shift 2; done; }
+
+render_account(){
+  local a="$1" d uid prof wb sp sb mem cpu pids disk bw pm pe aliases domains dir
+  d="$(get_field accounts primary_domain "$a")"; uid="$(get_field accounts uid "$a")"; prof="$(get_field accounts profile "$a")"
+  IFS='|' read -r wb sp sb <<<"$(dbq "SELECT web_backend||'|'||sftp_public||'|'||sftp_backend FROM ports WHERE account='$(sql_escape "$a")';")"
+  IFS='|' read -r mem cpu pids disk bw pm pe <<<"$(dbq "SELECT memory||'|'||cpus||'|'||pids||'|'||disk_bytes||'|'||bandwidth_bytes||'|'||php_memory||'|'||php_execution FROM resource_limits WHERE account='$(sql_escape "$a")';")"
+  aliases="$(dbq "SELECT group_concat(domain,' ') FROM domains WHERE account='$(sql_escape "$a")';")"; domains="$aliases"; dir="$(account_dir "$a")"
+  install -d -m 0750 "$dir/nginx"; cp "$LIB/templates/app-nginx.conf.tpl" "$dir/nginx/default.conf"; chmod 0644 "$dir/nginx/default.conf"
+  replace_template "$LIB/templates/compose.yaml.tpl" "$dir/compose.yaml" ACCOUNT "$a" UID "$uid" WEB_PORT "$wb" SFTP_BACKEND "$sb" MEMORY "$mem" CPUS "$cpu" PIDS "$pids" PHP_IMAGE "$PHP_RUNTIME_IMAGE" MYSQL_CONTAINER "$MYSQL_CONTAINER" DB_NETWORK "$DB_NETWORK"
+  replace_template "$LIB/templates/nginx.conf.tpl" "$ETC/nginx/$a.conf" ACCOUNT "$a" DOMAINS "$domains" WEB_PORT "$wb" UPLOAD "$(get_field resource_limits php_memory "$a")"
+  printf '%s\n' "$prof" >"$dir/PROFILE"; chmod 0640 "$dir/compose.yaml" "$ETC/nginx/$a.conf"
+}
+nginx_test_reload(){
+  if simulated; then return 0; fi
+  nginx -t || die "$EXIT_DEPENDENCY" "nginx configuration validation failed"
+  systemctl reload nginx
+}
+compose(){ local a="$1"; shift; simulated && return 0; docker compose -p "whc_$a" -f "$(account_dir "$a")/compose.yaml" "$@"; }
+mysql_exec(){ local q="$1"; simulated && return 0; docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$(grep '^MYSQL_ROOT_PASSWORD=' "$(path /etc/hosting-platform/mysql.env)" | cut -d= -f2-)" -e "$q"; }
+
+create_account(){
+  local a="$1" domain="$2"; shift 2; local profile=generic aliases= memory=768m cpus=1.5 pids=150 disk=10G bandwidth=100G upload=120M php_mem=512M php_exec=120 source_writable=1 auto_ssl=0 genpass=1 supplied= dry=0 letsencrypt_email=
+  while (($#)); do case "$1" in
+    --profile) profile="$2"; shift 2;; --alias) aliases+="${2,,}"$'\n'; shift 2;; --aliases) aliases+="${2//,/$'\n'}"$'\n'; shift 2;; --memory) memory="$2"; shift 2;; --cpus) cpus="$2"; shift 2;; --pids) pids="$2"; shift 2;; --disk) disk="$2"; shift 2;; --bandwidth) bandwidth="$2"; shift 2;; --upload-size) upload="$2"; shift 2;; --php-memory) php_mem="$2"; shift 2;; --php-max-execution) php_exec="$2"; shift 2;; --letsencrypt-email) letsencrypt_email="$2"; shift 2;; --source-writable) source_writable=1; shift;; --auto-ssl) auto_ssl=1; shift;; --generate-password) genpass=1; shift;; --password-stdin) supplied="$(cat)"; genpass=0; shift;; --dry-run) dry=1; shift;; --json) JSON=true; shift;; *) die "$EXIT_USAGE" "unknown account create option: $1";; esac; done
+  valid_account "$a" || die "$EXIT_VALIDATION" "invalid account name"; domain="${domain,,}"; valid_domain "$domain" || die "$EXIT_VALIDATION" "invalid domain"
+  [[ "$profile" == generic ]] || die "$EXIT_VALIDATION" "only the universal generic runtime is supported; install Laravel, CodeIgniter, WordPress, or another application from its account shell"
+  account_exists "$a" && die "$EXIT_CONFLICT" "account already exists: $a"; domain_taken "$domain" && die "$EXIT_CONFLICT" "domain already assigned: $domain"
+  local al; while IFS= read -r al; do [[ -z "$al" ]] && continue; valid_domain "$al" || die "$EXIT_VALIDATION" "invalid alias: $al"; domain_taken "$al" && die "$EXIT_CONFLICT" "domain already assigned: $al"; done <<<"$aliases"
+  [[ "$cpus" =~ ^[0-9]+([.][0-9]+)?$ && "$pids" =~ ^[0-9]+$ && "$php_exec" =~ ^[0-9]+$ ]] || die "$EXIT_VALIDATION" "invalid resource limit"
+  local uid wb sp sb sftp_pass db_pass dbname user dir; uid="$(next_free accounts uid "$CUSTOMER_UID_START" "$CUSTOMER_UID_END")"; wb="$(next_free ports web_backend "$WEB_PORT_START" "$WEB_PORT_END")"; sp="$(next_free ports sftp_public "$SFTP_PUBLIC_PORT_START" "$SFTP_PUBLIC_PORT_END")"; sb="$(next_free ports sftp_backend "$SFTP_BACKEND_PORT_START" "$SFTP_BACKEND_PORT_END")"
+  sftp_pass="${supplied:-$(password)}"; [[ ${#sftp_pass} -ge 12 ]] || die "$EXIT_VALIDATION" "SFTP password must be at least 12 characters"; db_pass="$(password)"; dbname="${a}_db"; user="${a}_db"; dir="$(account_dir "$a")"
+  ((dry)) && { note "Would create $a ($domain), uid $uid, web $wb, SFTP $sp"; return; }
+  lock global; local created=0
+  cleanup_create(){ local rc=$?; if ((rc != 0 && created)); then compose "$a" down --remove-orphans >/dev/null 2>&1 || true; rm -rf -- "$dir" "$ETC/nginx/$a.conf" "$(secret_file "$a")"; db "DELETE FROM accounts WHERE account='$(sql_escape "$a")';" >/dev/null 2>&1 || true; fi; return "$rc"; }
+  trap cleanup_create RETURN
+  install -d -m 0750 "$dir/app/public_html" "$dir/writable" "$dir/cron" "$dir/logs"; created=1
+  printf '<!doctype html><title>%s</title><h1>%s is ready</h1>\n' "$domain" "$domain" >"$dir/app/public_html/index.html"
+  chown -R "$uid:$uid" "$dir" 2>/dev/null || true; chmod 0750 "$dir" "$dir/app"; chmod 0770 "$dir/writable"
+  db "BEGIN; INSERT INTO accounts VALUES('$(sql_escape "$a")','$(sql_escape "$domain")',$uid,'$profile','active','$(now)',$source_writable); INSERT INTO domains VALUES('$(sql_escape "$domain")','$(sql_escape "$a")','primary'); INSERT INTO ports VALUES('$(sql_escape "$a")',$wb,$sp,$sb); INSERT INTO resource_limits VALUES('$(sql_escape "$a")','$(sql_escape "$memory")','$(sql_escape "$cpus")',$pids,$(bytes "$disk"),$(bytes "$bandwidth"),'$(sql_escape "$php_mem")',$php_exec,'warn','warn'); INSERT INTO suspensions(account) VALUES('$(sql_escape "$a")'); INSERT INTO databases VALUES('$(sql_escape "$a")','$(sql_escape "$dbname")','$(sql_escape "$user")'); COMMIT;"
+  while IFS= read -r al; do [[ -z "$al" ]] && continue; db "INSERT INTO domains VALUES('$(sql_escape "$al")','$(sql_escape "$a")','alias');"; done <<<"$aliases"
+  write_secret "$a" "$sftp_pass" "$db_pass"; render_account "$a"
+  mysql_exec "CREATE DATABASE IF NOT EXISTS \`${dbname}\`; CREATE USER IF NOT EXISTS '${user}'@'%' IDENTIFIED BY '${db_pass}'; GRANT ALL PRIVILEGES ON \`${dbname}\`.* TO '${user}'@'%'; FLUSH PRIVILEGES;"
+  compose "$a" config >/dev/null; nginx_test_reload; compose "$a" up -d
+  if ! simulated; then ufw allow "$sp"/tcp comment "webhostcli $a SFTP"; fi
+  audit "$a" create success; trap - RETURN
+  if $JSON; then db -json "SELECT a.account,a.primary_domain,a.profile,p.web_backend,p.sftp_public FROM accounts a JOIN ports p USING(account) WHERE a.account='$(sql_escape "$a")';"; else note "Created account $a"; note "SFTP: $a@$domain port $sp"; note "Credentials: $(secret_file "$a") (root only)"; fi
+  ((auto_ssl)) && LETSENCRYPT_EMAIL="$letsencrypt_email" ssl_issue "$a" || true
+}
+
+list_accounts(){ if $JSON; then db -json 'SELECT a.account,a.primary_domain,a.profile,a.status,p.sftp_public FROM accounts a JOIN ports p USING(account) ORDER BY a.account;'; else db -header -column 'SELECT a.account AS ACCOUNT,a.primary_domain AS DOMAIN,a.profile AS PROFILE,a.status AS STATUS,p.sftp_public AS SFTP_PORT FROM accounts a JOIN ports p USING(account) ORDER BY a.account;'; fi; }
+show_account(){ check_account "$1"; local a="$1"; if $JSON; then db -json "SELECT a.*,p.web_backend,p.sftp_public,p.sftp_backend,l.memory,l.cpus,l.pids,l.disk_bytes,l.bandwidth_bytes,s.full_suspended,s.web_suspended,s.sftp_suspended,s.database_suspended,s.reason FROM accounts a JOIN ports p USING(account) JOIN resource_limits l USING(account) JOIN suspensions s USING(account) WHERE a.account='$(sql_escape "$a")';"; else db -header -column "SELECT a.account,a.primary_domain,a.profile,a.status,p.web_backend,p.sftp_public,l.memory,l.cpus,l.pids,l.disk_bytes,l.bandwidth_bytes,s.reason FROM accounts a JOIN ports p USING(account) JOIN resource_limits l USING(account) JOIN suspensions s USING(account) WHERE a.account='$(sql_escape "$a")';"; fi; }
+account_service(){ local action="$1" a="$2"; check_account "$a"; lock "account-$a"; case "$action" in start) compose "$a" up -d;; stop) compose "$a" stop;; restart) compose "$a" restart;; esac; audit "$a" "$action" success; note "$action completed for $a"; }
+suspend_account(){ local a="$1" mode="$2" reason="${3:-}"; check_account "$a"; lock "account-$a"; local col svc
+ case "$mode" in full) col=full_suspended; svc=(stop);; web) col=web_suspended; svc=(stop web php cron);; sftp) col=sftp_suspended; svc=(stop sftp);; database) col=database_suspended; svc=();; esac
+ db "UPDATE suspensions SET $col=1,reason='$(sql_escape "$reason")',suspended_at='$(now)',suspended_by='$(administrator)' WHERE account='$(sql_escape "$a")';"; [[ "$mode" != database ]] && compose "$a" "${svc[@]}"; [[ "$mode" != web && "$mode" != full ]] || { cp "$ETC/nginx/$a.conf" "$ETC/nginx/$a.conf.active"; sed -i 's|proxy_pass http://127.0.0.1:[0-9]*;|root /srv/hosting/suspended-page; try_files /index.html =503;|' "$ETC/nginx/$a.conf"; nginx_test_reload; }; [[ "$mode" != database ]] || mysql_exec "ALTER USER '$(get_field databases username "$a")'@'%' ACCOUNT LOCK;"; audit "$a" "suspend-$mode" success "$reason"; note "$a suspended ($mode)"; }
+unsuspend_account(){ local a="$1" mode="$2"; check_account "$a"; lock "account-$a"; local col svc
+ case "$mode" in full) col=full_suspended; svc=(up -d);; web) col=web_suspended; svc=(up -d web php cron);; sftp) col=sftp_suspended; svc=(up -d sftp);; database) col=database_suspended; svc=();; esac
+ db "UPDATE suspensions SET $col=0 WHERE account='$(sql_escape "$a")';"; [[ "$mode" != database ]] && compose "$a" "${svc[@]}"; [[ "$mode" != web && "$mode" != full ]] || { [[ -f "$ETC/nginx/$a.conf.active" ]] && mv -f "$ETC/nginx/$a.conf.active" "$ETC/nginx/$a.conf"; nginx_test_reload; }; [[ "$mode" != database ]] || mysql_exec "ALTER USER '$(get_field databases username "$a")'@'%' ACCOUNT UNLOCK;"; audit "$a" "unsuspend-$mode" success; note "$a unsuspended ($mode)"; }
+
+domain_cmd(){ local sub="$1"; shift; case "$sub" in
+ list) db -header -column 'SELECT domain,account,kind FROM domains ORDER BY domain;';;
+ show) valid_domain "$1" || die "$EXIT_VALIDATION" 'invalid domain'; db -header -column "SELECT * FROM domains WHERE domain='$(sql_escape "$1")';";;
+ check) valid_domain "$1" || die "$EXIT_VALIDATION" 'invalid domain'; getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u || true;;
+ alias-add) local a="$1" d="${2,,}"; check_account "$a"; valid_domain "$d" || die 4 'invalid domain'; domain_taken "$d" && die 5 'domain already assigned'; db "INSERT INTO domains VALUES('$(sql_escape "$d")','$(sql_escape "$a")','alias');"; render_account "$a"; nginx_test_reload;;
+ alias-remove) local a="$1" d="${2,,}"; check_account "$a"; [[ "$(dbq "SELECT kind FROM domains WHERE domain='$(sql_escape "$d")';")" == alias ]] || die 3 'alias not found'; db "DELETE FROM domains WHERE domain='$(sql_escape "$d")' AND account='$(sql_escape "$a")';"; render_account "$a"; nginx_test_reload;;
+ primary-change) local a="$1" d="${2,,}" old; check_account "$a"; valid_domain "$d" || die 4 'invalid domain'; domain_taken "$d" && die 5 'domain already assigned'; old="$(get_field accounts primary_domain "$a")"; db "BEGIN; UPDATE accounts SET primary_domain='$(sql_escape "$d")' WHERE account='$(sql_escape "$a")'; UPDATE domains SET domain='$(sql_escape "$d")' WHERE domain='$(sql_escape "$old")'; COMMIT;"; render_account "$a"; nginx_test_reload;;
+ *) die 2 'usage: domain list|show|check|alias-add|alias-remove|primary-change';; esac; }
+
+ssl_issue(){ local a="$1"; check_account "$a"; simulated && { note "SSL issuance simulated for $a"; return; }; local domain; domain="$(get_field accounts primary_domain "$a")"; nginx -t; certbot --nginx -d "$domain" --non-interactive --agree-tos --email "${LETSENCRYPT_EMAIL:?set LETSENCRYPT_EMAIL or use interactive certbot}"; audit "$a" ssl-issue success; }
+ssl_cmd(){ local sub="$1"; shift; case "$sub" in issue) ssl_issue "$1";; status) check_account "$1"; certbot certificates -d "$(get_field accounts primary_domain "$1")";; renew) check_account "$1"; simulated || certbot renew --cert-name "$(get_field accounts primary_domain "$1")";; renew-all) simulated || certbot renew;; revoke) check_account "$1"; die 2 'certificate revoke requires an explicit certbot invocation to prevent accidental revocation';; *) die 2 'usage: ssl issue|status|renew|renew-all|revoke';; esac; }
+
+sftp_cmd(){ local sub="$1" a="$2"; check_account "$a"; case "$sub" in show) db -header -column "SELECT a.account,p.sftp_public,s.sftp_suspended FROM accounts a JOIN ports p USING(account) JOIN suspensions s USING(account) WHERE a.account='$(sql_escape "$a")';";; enable) unsuspend_account "$a" sftp;; disable) suspend_account "$a" sftp;; password-reset) local p; p="$(password)"; local tmp; tmp="$(mktemp "$SECRETS/.${a}.XXXX")"; sed "s/^SFTP_PASSWORD=.*/SFTP_PASSWORD=$(printf %q "$p")/" "$(secret_file "$a")" >"$tmp"; chmod 600 "$tmp"; mv "$tmp" "$(secret_file "$a")"; compose "$a" restart sftp; note "SFTP password reset; retrieve with: webhostcli account credentials $a";; sessions) simulated || docker ps --format '{{.Names}} {{.Status}}' | grep "whc_$a.*sftp" || true;; *) die 2 'usage: sftp show|enable|disable|password-reset|sessions ACCOUNT';; esac; }
+
+database_cmd(){ local sub="$1" a="$2"; check_account "$a"; local name user file; name="$(get_field databases name "$a")"; user="$(get_field databases username "$a")"; case "$sub" in
+ show|list) db -header -column "SELECT name,username FROM databases WHERE account='$(sql_escape "$a")';";; size) simulated && { echo 0; return; }; mysql_exec "SELECT table_schema,ROUND(SUM(data_length+index_length)) bytes FROM information_schema.tables WHERE table_schema LIKE '${a}%' GROUP BY table_schema;";;
+ password-reset) local p; p="$(password)"; mysql_exec "ALTER USER '$user'@'%' IDENTIFIED BY '$p';"; sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=$(printf %q "$p")/" "$(secret_file "$a")"; note "Database password reset; retrieve with account credentials.";;
+ export) shift 2; if [[ "${1:-}" == --output ]]; then file="$2"; else file="${1:-$SRV/backups/${a}-$(date +%F).sql}"; fi; mkdir -p "$(dirname "$file")"; simulated && { : >"$file"; return; }; docker exec "$MYSQL_CONTAINER" mysqldump -uroot "$name" >"$file";;
+ import) file="$3"; [[ -f "$file" && -s "$file" ]] || die 4 'SQL file missing or empty'; [[ "${WEBHOSTCLI_CONFIRM_IMPORT:-}" == "$a" ]] || die 2 "set WEBHOSTCLI_CONFIRM_IMPORT=$a to confirm destructive import"; backup_create "$a"; simulated || docker exec -i "$MYSQL_CONTAINER" mysql "$name" <"$file";;
+ create-extra) local extra="$3"; valid_account "$extra" || die 4 'invalid extra database suffix'; local en="${a}_${extra}"; db "INSERT INTO databases VALUES('$(sql_escape "$a")','$(sql_escape "$en")','$(sql_escape "$user")');"; mysql_exec "CREATE DATABASE \`$en\`; GRANT ALL PRIVILEGES ON \`$en\`.* TO '$user'@'%';";;
+ drop-extra) local en="${a}_$3"; [[ "$en" != "$name" ]] || die 4 'cannot drop primary database'; [[ "${WEBHOSTCLI_CONFIRM_DROP:-}" == "$en" ]] || die 2 "set WEBHOSTCLI_CONFIRM_DROP=$en to confirm"; mysql_exec "DROP DATABASE \`$en\`;"; db "DELETE FROM databases WHERE account='$(sql_escape "$a")' AND name='$(sql_escape "$en")';";;
+ *) die 2 'usage: database show|size|password-reset|export|import|create-extra|list|drop-extra ACCOUNT';; esac; }
+
+collect_metrics(){ local only="${1:-}" a; while read -r a; do [[ -n "$a" ]] || continue; local dir disk dbsize cpu=0 mem=0 pids=0 restarts=0; dir="$(account_dir "$a")"; disk="$(du -sb -- "$dir" 2>/dev/null | awk '{print $1}' || echo 0)"; dbsize=0; if ! simulated; then read -r cpu mem pids restarts < <(docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "whc_${a}-web-1" 2>/dev/null | awk '{gsub("%","",$1); print $1,0,0,0}' || echo '0 0 0 0'); fi; db "INSERT OR REPLACE INTO metrics VALUES('$(sql_escape "$a")','$(now)',$cpu,$mem,$pids,$restarts,$disk,$dbsize);"; done < <(if [[ -n "$only" ]]; then echo "$only"; else dbq 'SELECT account FROM accounts;'; fi); }
+usage_cmd(){ local sub="$1"; shift; case "$sub" in
+ all) db -header -column 'SELECT a.account,COALESCE(m.cpu,0) cpu,COALESCE(m.memory_bytes,0) memory,COALESCE(m.disk_bytes,0) disk FROM accounts a LEFT JOIN metrics m ON m.account=a.account AND m.sampled_at=(SELECT max(sampled_at) FROM metrics WHERE account=a.account) ORDER BY a.account;';;
+ current) check_account "$1"; collect_metrics "$1"; db -header -column "SELECT * FROM metrics WHERE account='$(sql_escape "$1")' ORDER BY sampled_at DESC LIMIT 1;";;
+ live) check_account "$1"; simulated && { usage_cmd current "$1"; return; }; docker stats --no-stream "whc_$1-web-1" "whc_$1-php-1";;
+ disk) check_account "$1"; local a="$1"; du -sh "$(account_dir "$a")/app" "$(account_dir "$a")/writable" "$(account_dir "$a")/logs" 2>/dev/null; db -header -column "SELECT disk_bytes FROM metrics WHERE account='$(sql_escape "$a")' ORDER BY sampled_at DESC LIMIT 1;";;
+ bandwidth) check_account "$1"; db -header -column "SELECT * FROM bandwidth_daily WHERE account='$(sql_escape "$1")' ORDER BY day DESC;";;
+ database) database_cmd size "$1";;
+ report) local a="$1"; shift; check_account "$a"; local filter=""; case "${1:-}" in --today) filter="AND day=date('now')";; --month) filter="AND day LIKE strftime('%Y-%m','now')||'%'";; --from) filter="AND day BETWEEN '$2' AND '$4'";; esac; db -header -column "SELECT account,sum(http_in+sftp_in) inbound,sum(http_out+sftp_out) outbound,sum(requests) requests,sum(status4xx) status4xx,sum(status5xx) status5xx FROM bandwidth_daily WHERE account='$(sql_escape "$a")' $filter GROUP BY account;";;
+ top) local field="$1"; case "$field" in cpu) db -header -column 'SELECT account,MAX(cpu) value FROM metrics GROUP BY account ORDER BY value DESC LIMIT 10;';; memory) db -header -column 'SELECT account,MAX(memory_bytes) value FROM metrics GROUP BY account ORDER BY value DESC LIMIT 10;';; disk) db -header -column 'SELECT account,MAX(disk_bytes) value FROM metrics GROUP BY account ORDER BY value DESC LIMIT 10;';; bandwidth) db -header -column 'SELECT account,SUM(http_in+http_out+sftp_in+sftp_out) value FROM bandwidth_daily GROUP BY account ORDER BY value DESC LIMIT 10;';; *) die 4 'top field must be cpu, memory, disk, or bandwidth';; esac;;
+ rebuild) check_account "$1"; rebuild_bandwidth "$1";; *) die 2 'usage: usage all|current|live|disk|bandwidth|database|report|top|rebuild';; esac; }
+rebuild_bandwidth(){ local a="$1" log; log="$LOG/nginx/$a.access.log"; [[ -f "$log" ]] || { note 'No retained access log.'; return; }; python3 - "$DB" "$a" "$log" <<'PY'
+import json,sqlite3,sys
+db,a,fn=sys.argv[1:]; c=sqlite3.connect(db)
+for line in open(fn,errors='replace'):
+ try:
+  x=json.loads(line); day=x['timestamp'][:10]; inn=int(x.get('request_length',0)); out=int(x.get('body_bytes_sent',0)); status=int(x.get('status',0))
+  c.execute("INSERT INTO bandwidth_daily(account,day,http_in,http_out,requests,status4xx,status5xx) VALUES(?,?,?,?,?,?,?) ON CONFLICT(account,day) DO UPDATE SET http_in=http_in+excluded.http_in,http_out=http_out+excluded.http_out,requests=requests+1,status4xx=status4xx+excluded.status4xx,status5xx=status5xx+excluded.status5xx",(a,day,inn,out,1,status//100==4,status//100==5))
+ except Exception: pass
+c.commit()
+PY
+}
+
+backup_create(){ local a="$1"; check_account "$a"; lock "account-$a"; local id="${a}-$(date -u +%Y%m%dT%H%M%SZ)" tmp dest; tmp="$(mktemp -d "$SRV/backups/.${a}.XXXX")"; dest="$SRV/backups/$id"; trap 'rm -rf -- "$tmp"' RETURN; cp -a --no-dereference "$(account_dir "$a")" "$tmp/account"; cp -a --no-dereference "$ETC/nginx/$a.conf" "$tmp/nginx.conf"; db ".dump" >"$tmp/metadata.sql"; database_cmd export "$a" "$tmp/database.sql"; printf '%s\n' "$VERSION" >"$tmp/WEBHOSTCLI_VERSION"; (cd "$tmp" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum) >"$tmp/SHA256SUMS"; mv "$tmp" "$dest"; trap - RETURN; db "INSERT INTO backups(id,account,path,created_at) VALUES('$(sql_escape "$id")','$(sql_escape "$a")','$(sql_escape "$dest")','$(now)');"; audit "$a" backup-create success; echo "$id"; }
+backup_cmd(){ local sub="$1"; shift; case "$sub" in create) backup_create "$1";; create-all) while read -r a; do backup_create "$a"; done < <(dbq 'SELECT account FROM accounts;');; list) check_account "$1"; $JSON && db -json "SELECT * FROM backups WHERE account='$(sql_escape "$1")' ORDER BY created_at DESC;" || db -header -column "SELECT * FROM backups WHERE account='$(sql_escape "$1")' ORDER BY created_at DESC;";; verify) local id="$1" p; p="$(dbq "SELECT path FROM backups WHERE id='$(sql_escape "$id")';")"; [[ -d "$p" ]] || die 3 'backup not found'; (cd "$p" && sha256sum -c SHA256SUMS); db "UPDATE backups SET verified_at='$(now)' WHERE id='$(sql_escape "$id")';";; restore) local a="$1" id="$2" p; check_account "$a"; p="$(dbq "SELECT path FROM backups WHERE id='$(sql_escape "$id")' AND account='$(sql_escape "$a")';")"; [[ -d "$p" ]] || die 3 'backup not found for account'; backup_cmd verify "$id"; [[ "${WEBHOSTCLI_CONFIRM_RESTORE:-}" == "$a" ]] || die 2 "set WEBHOSTCLI_CONFIRM_RESTORE=$a to restore"; backup_create "$a" >/dev/null; compose "$a" stop; rsync -a --delete --safe-links "$p/account/" "$(account_dir "$a")/"; compose "$a" up -d;; delete) local id="$1" p; p="$(dbq "SELECT path FROM backups WHERE id='$(sql_escape "$id")';")"; [[ -n "$p" ]] || die 3 'backup not found'; [[ "${WEBHOSTCLI_CONFIRM_DELETE_BACKUP:-}" == "$id" ]] || die 2 "set WEBHOSTCLI_CONFIRM_DELETE_BACKUP=$id to confirm"; safe_path "${p/$SRV\/backups/$CUSTOMER_ROOT}" || true; rm -rf -- "$p"; db "DELETE FROM backups WHERE id='$(sql_escape "$id")';";; schedule) local a="$1" freq="$2" retain="$4"; check_account "$a"; [[ "$freq" =~ ^(daily|weekly)$ && "$3" == --retain && "$retain" =~ ^[0-9]+$ ]] || die 2 'usage: backup schedule ACCOUNT daily|weekly --retain N'; db "UPDATE backups SET schedule='$freq:$retain' WHERE account='$(sql_escape "$a")';";; *) die 2 'usage: backup create|create-all|list|verify|restore|delete|schedule';; esac; }
+
+limits_cmd(){ local sub="$1" a="$2"; check_account "$a"; case "$sub" in show) db -header -column "SELECT * FROM resource_limits WHERE account='$(sql_escape "$a")';";; set) shift 2; local sets=(); while (($#)); do case "$1" in --memory) sets+=("memory='$(sql_escape "$2")'");; --cpus) sets+=("cpus='$(sql_escape "$2")'");; --pids) sets+=("pids=$2");; --disk) sets+=("disk_bytes=$(bytes "$2")");; --bandwidth) sets+=("bandwidth_bytes=$(bytes "$2")");; *) die 2 "unknown limit: $1";; esac; shift 2; done; ((${#sets[@]})) || die 2 'no limits supplied'; local IFS=,; db "UPDATE resource_limits SET ${sets[*]} WHERE account='$(sql_escape "$a")';"; render_account "$a"; compose "$a" up -d --force-recreate;; policy) shift 2; local da= ba=; while (($#)); do case "$1" in --disk-action) da="$2";; --bandwidth-action) ba="$2";; *) die 2 'unknown policy';; esac; shift 2; done; [[ -z "$da" || "$da" =~ ^(warn|disable-sftp|suspend)$ ]] || die 4 'invalid disk action'; [[ -z "$ba" || "$ba" =~ ^(warn|throttle|suspend)$ ]] || die 4 'invalid bandwidth action'; [[ -z "$da" ]] || db "UPDATE resource_limits SET disk_action='$da' WHERE account='$(sql_escape "$a")';"; [[ -z "$ba" ]] || db "UPDATE resource_limits SET bandwidth_action='$ba' WHERE account='$(sql_escape "$a")';";; *) die 2 'usage: limits show|set|policy ACCOUNT';; esac; }
+
+php_cmd(){ local sub="$1" a="$2"; check_account "$a"; case "$sub" in info|config-show) cat "$(account_dir "$a")/PROFILE"; db -header -column "SELECT php_memory,php_execution FROM resource_limits WHERE account='$(sql_escape "$a")';";; restart) compose "$a" restart php;; config-set) shift 2; [[ "$1" =~ ^--(memory|upload-size|max-execution)$ ]] || die 2 'invalid PHP setting'; local col; case "$1" in --memory) col=php_memory;; --max-execution) col=php_execution;; --upload-size) note 'Upload size is applied in nginx account configuration'; return;; esac; db "UPDATE resource_limits SET $col='$(sql_escape "$2")' WHERE account='$(sql_escape "$a")';"; render_account "$a"; compose "$a" up -d --force-recreate php;; *) die 2 'usage: php info|restart|config-show|config-set ACCOUNT';; esac; }
+shell_cmd(){ local a="$1"; shift; check_account "$a"; if simulated; then note "Would open an isolated shell for $a as UID $(get_field accounts uid "$a")"; return; fi; if (($#)); then compose "$a" exec -T php "$@"; else compose "$a" exec php sh; fi; }
+composer_cmd(){ local a="$1"; shift; check_account "$a"; compose "$a" exec -T php composer "$@"; }
+cron_cmd(){ local sub="$1" a="$2"; check_account "$a"; case "$sub" in list) db -header -column "SELECT * FROM cron_jobs WHERE account='$(sql_escape "$a")';";; add) shift 2; local schedule="$1" command="$2"; [[ "$schedule" =~ ^[^[:space:]]+\ [^[:space:]]+\ [^[:space:]]+\ [^[:space:]]+\ [^[:space:]]+$ ]] || die 4 'cron schedule must have five fields'; db "INSERT INTO cron_jobs(account,schedule,command) VALUES('$(sql_escape "$a")','$(sql_escape "$schedule")','$(sql_escape "$command")');";; remove|enable|disable) local id="$3"; db "UPDATE cron_jobs SET enabled=$([[ "$sub" == enable ]] && echo 1 || echo 0) WHERE id=$id AND account='$(sql_escape "$a")';"; [[ "$sub" == remove ]] && db "DELETE FROM cron_jobs WHERE id=$id AND account='$(sql_escape "$a")';";; logs) tail -n 100 "$(account_dir "$a")/logs/cron.log" 2>/dev/null || true;; *) die 2 'usage: cron list|add|remove|enable|disable|logs ACCOUNT';; esac; }
+
+logs_cmd(){ local sub="$1"; shift; local f=; case "$sub" in activity) f="$LOG/audit.log";; errors) f="$LOG/errors.log";; collector) f="$LOG/collector.log";; database) f="$LOG/database.log";; nginx|apache|php|sftp) check_account "$1"; f="$(account_dir "$1")/logs/$sub.log"; shift;; tail) check_account "$1"; f="$(account_dir "$1")/logs/app.log"; shift;; *) die 2 'unknown log';; esac; local n=100 follow=0; while (($#)); do case "$1" in --lines) n="$2"; shift 2;; --follow) follow=1; shift;; --since) shift 2;; *) die 2 'unknown log option';; esac; done; [[ -f "$f" ]] || : >"$f"; ((follow)) && tail -n "$n" -f "$f" || tail -n "$n" "$f"; }
+service_cmd(){ local sub="$1"; shift; case "$sub" in status|health) $JSON && printf '{"nginx":"%s","docker":"%s"}\n' "$(systemctl is-active nginx 2>/dev/null || echo unknown)" "$(systemctl is-active docker 2>/dev/null || echo unknown)" || systemctl --no-pager --type=service --state=running | grep -E 'nginx|docker|webhostcli' || true;; restart) case "$1" in nginx) simulated || systemctl restart nginx;; mysql) simulated || docker restart "$MYSQL_CONTAINER";; phpmyadmin) simulated || docker restart "$PMA_CONTAINER";; *) die 4 'service not allowed';; esac;; *) die 2 'usage: service status|health|restart';; esac; }
+server_cmd(){ local sub="$1"; case "$sub" in info|status) if $JSON; then python3 - <<PY
+import json,os; print(json.dumps({'hostname':os.uname().nodename,'accounts':int('$(dbq 'SELECT count(*) FROM accounts;')')}))
+PY
+else hostnamectl 2>/dev/null || uname -a; df -h "$SRV"; fi;; ports) ss -lntp 2>/dev/null || true;; updates) apt list --upgradable 2>/dev/null || true;; update-security) simulated || unattended-upgrade -d;; docker-usage) docker system df 2>/dev/null || true;; *) die 2 'usage: server info|status|ports|updates|update-security|docker-usage';; esac; }
+security_cmd(){ local sub="$1"; shift; case "$sub" in audit|status) local bad=0; if ! simulated && ss -lnt | grep -qE '(^|:)3306 '; then echo 'FAIL public MySQL listener'; bad=1; else echo 'OK MySQL public listener'; fi; [[ -f "$DB" && $(stat -c %a "$DB") == 600 ]] && echo 'OK state database permissions' || { echo 'FAIL state database permissions'; bad=1; }; find "$SECRETS" -type f ! -perm 600 -print | grep -q . && { echo 'FAIL secret permissions'; bad=1; } || echo 'OK secret permissions'; return "$bad";; blocked-ips) fail2ban-client status 2>/dev/null || true;; unblock-ip) [[ "$1" =~ ^[0-9a-fA-F:.]+$ ]] || die 4 'invalid IP'; fail2ban-client unban "$1" 2>/dev/null || true;; scan|scan-all) cmd_exists clamscan && clamscan -r "${1:+$(account_dir "$1")}" || echo 'ClamAV is not installed (optional).';; permissions) check_account "$1"; find "$(account_dir "$1")" -xdev -perm -0002 -print;; *) die 2 'usage: security audit|status|blocked-ips|unblock-ip|scan|scan-all|permissions';; esac; }
+
+import_existing(){ local registry="$(path /etc/hosting-platform/accounts.tsv)" imported=0 skipped=0 bad=0 a domain uid wb sp sb profile aliases; [[ -f "$registry" ]] || { note 'No legacy registry found.'; return; }; while IFS=$'\t' read -r a domain uid wb sp sb profile aliases; do [[ "$a" == account || -z "$a" ]] && continue; if account_exists "$a"; then ((skipped+=1)); continue; fi; if ! valid_account "$a" || ! valid_domain "$domain" || [[ ! "$uid" =~ ^[0-9]+$ ]]; then ((bad+=1)); continue; fi; db "BEGIN; INSERT OR IGNORE INTO accounts VALUES('$(sql_escape "$a")','$(sql_escape "$domain")',$uid,'generic','active','$(now)',1); INSERT OR IGNORE INTO domains VALUES('$(sql_escape "$domain")','$(sql_escape "$a")','primary'); INSERT OR IGNORE INTO ports VALUES('$(sql_escape "$a")',${wb:-0},${sp:-0},${sb:-0}); INSERT OR IGNORE INTO resource_limits VALUES('$(sql_escape "$a")','768m','1.5',150,10737418240,107374182400,'512M',120,'warn','warn'); INSERT OR IGNORE INTO suspensions(account) VALUES('$(sql_escape "$a")'); COMMIT;"; ((imported+=1)); done <"$registry"; printf 'Imported accounts: %d\nSkipped accounts: %d\nInconsistent accounts: %d\nMissing containers: not checked in import mode\nMissing Nginx files: %d\nMissing database users: not checked in import mode\n' "$imported" "$skipped" "$bad" "$(find "$CUSTOMER_ROOT" -mindepth 1 -maxdepth 1 -type d ! -exec test -f "$ETC/nginx/{}.conf" \; -print 2>/dev/null | wc -l)"; }
+doctor(){ local issue=0; for x in "$DB" "$CUSTOMER_ROOT" "$SECRETS"; do [[ -e "$x" ]] && echo "OK $x" || { echo "MISSING $x"; issue=1; }; done; [[ -f "$BOOTSTRAP_MARKER" ]] && echo 'OK legacy bootstrap detected' || echo 'INFO no legacy bootstrap marker'; simulated || { cmd_exists docker || { echo 'MISSING docker'; issue=1; }; cmd_exists nginx || { echo 'MISSING nginx'; issue=1; }; }; return "$issue"; }
+
+install_units(){
+ install -d -m 0755 "$(path /etc/systemd/system)"
+ cat >"$LIB/helpers/collect-metrics" <<EOF
+#!/bin/sh
+exec $BIN metrics-collect
+EOF
+ chmod 0750 "$LIB/helpers/collect-metrics"
+ cat >"$(path /etc/systemd/system/webhostcli-metrics.service)" <<EOF
+[Unit]
+Description=WebhostCLI metrics collector
+[Service]
+Type=oneshot
+ExecStart=$LIB/helpers/collect-metrics
+EOF
+ cat >"$(path /etc/systemd/system/webhostcli-metrics.timer)" <<'EOF'
+[Unit]
+Description=Run WebhostCLI metrics every five minutes
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+ cat >"$LIB/helpers/backup-mysql" <<EOF
+#!/bin/sh
+set -eu
+. "$(path /etc/hosting-platform/mysql.env)"
+mkdir -p "$(path /srv/hosting/backups/mysql)"
+exec docker exec "$MYSQL_CONTAINER" mysqldump -uroot -p"\$MYSQL_ROOT_PASSWORD" --single-transaction --routines --events --all-databases
+EOF
+ chmod 0750 "$LIB/helpers/backup-mysql"
+ cat >"$(path /etc/systemd/system/webhostcli-mysql-backup.service)" <<EOF
+[Unit]
+Description=WebhostCLI MySQL backup
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '$LIB/helpers/backup-mysql > $SRV/backups/mysql/mysql-\$(date +%%F).sql'
+EOF
+ cat >"$(path /etc/systemd/system/webhostcli-mysql-backup.timer)" <<'EOF'
+[Unit]
+Description=Daily WebhostCLI MySQL backup
+[Timer]
+OnCalendar=daily
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+ [[ -n "$ROOT" ]] || { systemctl daemon-reload; systemctl enable --now webhostcli-metrics.timer webhostcli-mysql-backup.timer; }
+}
+bootstrap_fresh(){
+  # This path is deliberately reachable only with CONFIRM_FRESH_SERVER=YES.
+  [[ -f /etc/os-release ]] || die "$EXIT_DEPENDENCY" 'Ubuntu Server is required'
+  . /etc/os-release
+  [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" =~ ^(22\.04|24\.04|26\.04)$ ]] || die "$EXIT_DEPENDENCY" 'supported releases are Ubuntu 22.04, 24.04, and 26.04'
+  note 'Installing fresh-server dependencies…'
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg lsb-release nginx libnginx-mod-stream ufw fail2ban apparmor auditd unattended-upgrades certbot python3-certbot-nginx sqlite3 jq openssl rsync acl logrotate cron
+  install -d -m 0755 /etc/apt/keyrings
+  if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.asc; chmod a+r /etc/apt/keyrings/docker.asc; fi
+  if [[ ! -f /etc/apt/sources.list.d/docker.list ]]; then echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" >/etc/apt/sources.list.d/docker.list; fi
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker nginx fail2ban auditd
+  ufw default deny incoming; ufw default allow outgoing; ufw allow OpenSSH; ufw allow 80/tcp; ufw allow 443/tcp; ufw --force enable
+  iptables -C DOCKER-USER -j RETURN 2>/dev/null || iptables -I DOCKER-USER -j RETURN
+  install -d -m 0750 /etc/hosting-platform /srv/hosting/database /srv/hosting/admin/phpmyadmin /srv/hosting/shared/php-runtime /srv/hosting/backups/mysql /var/log/hosting-platform
+  local rootpass; rootpass="$(password)"; printf 'MYSQL_ROOT_PASSWORD=%s\n' "$rootpass" >/etc/hosting-platform/mysql.env; chmod 0600 /etc/hosting-platform/mysql.env
+  cat >/srv/hosting/database/compose.yaml <<EOF
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: hosting-mysql
+    restart: unless-stopped
+    environment: { MYSQL_ROOT_PASSWORD: "$rootpass" }
+    volumes: ["mysql-data:/var/lib/mysql"]
+    networks: [hosting_db_core]
+volumes: { mysql-data: {} }
+networks: { hosting_db_core: { name: hosting_db_core } }
+EOF
+  cat >/srv/hosting/admin/phpmyadmin/compose.yaml <<'EOF'
+services:
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: hosting-phpmyadmin
+    restart: unless-stopped
+    ports: ["127.0.0.1:9090:80"]
+    environment: { PMA_HOST: hosting-mysql }
+    networks: [hosting_db_core]
+networks: { hosting_db_core: { external: true } }
+EOF
+  cat >/srv/hosting/shared/php-runtime/Dockerfile <<'EOF'
+FROM composer:2 AS composer
+FROM php:8.4-fpm-alpine
+COPY --from=composer /usr/bin/composer /usr/local/bin/composer
+RUN apk add --no-cache bash git unzip zip nodejs npm icu-libs libzip libpng libjpeg-turbo freetype imagemagick-libs \
+ && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS icu-dev libzip-dev libpng-dev libjpeg-turbo-dev freetype-dev imagemagick-dev \
+ && docker-php-ext-configure gd --with-freetype --with-jpeg \
+ && docker-php-ext-install -j"$(nproc)" pdo_mysql mysqli opcache pcntl bcmath intl zip gd \
+ && pecl install redis imagick && docker-php-ext-enable redis imagick \
+ && apk del .build-deps
+RUN addgroup -S hosting && adduser -S -G hosting hosting
+USER hosting
+EOF
+  docker compose -f /srv/hosting/database/compose.yaml up -d
+  docker build -t local/secure-hosting-php:8.4 /srv/hosting/shared/php-runtime
+  docker compose -f /srv/hosting/admin/phpmyadmin/compose.yaml up -d
+  cat >/etc/hosting-platform/platform.env <<'EOF'
+MYSQL_CONTAINER=hosting-mysql
+DB_NETWORK=hosting_db_core
+PMA_CONTAINER=hosting-phpmyadmin
+PMA_LOOPBACK_PORT=9090
+PHP_RUNTIME_IMAGE=local/secure-hosting-php:8.4
+WEB_PORT_START=8101
+WEB_PORT_END=8999
+SFTP_PUBLIC_PORT_START=22001
+SFTP_PUBLIC_PORT_END=22999
+SFTP_BACKEND_PORT_START=32001
+SFTP_BACKEND_PORT_END=32999
+CUSTOMER_UID_START=10001
+CUSTOMER_UID_END=59999
+EOF
+  touch /etc/hosting-platform/bootstrap.complete
+}
+install_cmd(){ local bootstrap=0 adopt=0 repair=0; while (($#)); do case "$1" in --bootstrap) bootstrap=1;; --adopt-existing) adopt=1;; --repair) repair=1;; *) die 2 "unknown install option: $1";; esac; shift; done; require_root; if [[ -f "$BOOTSTRAP_MARKER" && -f "$PLATFORM_ENV" ]]; then note 'Existing hosting bootstrap detected.'; note 'Reusing installed infrastructure.'; elif ! simulated && { cmd_exists docker || cmd_exists nginx; } && (( !adopt && !bootstrap )); then die 5 'Docker or Nginx exists without a bootstrap marker; rerun with --adopt-existing after reviewing the server'; elif ((bootstrap)) && ! simulated && [[ "${CONFIRM_FRESH_SERVER:-}" != YES ]]; then die 7 'fresh bootstrap requires CONFIRM_FRESH_SERVER=YES'; fi
+ if ((bootstrap)) && ! simulated && [[ ! -f "$BOOTSTRAP_MARKER" ]]; then bootstrap_fresh; fi
+ load_platform; mkdirs; init_db; write_templates; install_units; if [[ -f "$(path /etc/hosting-platform/accounts.tsv)" ]]; then import_existing; fi
+ if [[ "$(readlink -f "$0")" != "$(readlink -f "$BIN" 2>/dev/null || true)" ]]; then install -D -m 0750 "$0" "$BIN"; fi; printf '%s\n' "$VERSION" >"$LIB/version"; audit '' install success; note "WebhostCLI $VERSION installed. Run: sudo webhostcli doctor"; }
+uninstall_cmd(){ local purge=0; [[ "${1:-}" == --purge-all ]] && purge=1; require_root; if ((purge)); then [[ "${WEBHOSTCLI_CONFIRM_PURGE:-}" == DESTROY_HOSTING_DATA ]] || die 2 'set WEBHOSTCLI_CONFIRM_PURGE=DESTROY_HOSTING_DATA to purge all hosting data'; rm -rf -- "$CUSTOMER_ROOT" "$SRV/backups" "$DB"; fi; [[ -n "$ROOT" ]] || systemctl disable --now webhostcli-metrics.timer 2>/dev/null || true; rm -f "$BIN" "$(path /etc/systemd/system/webhostcli-metrics.service)" "$(path /etc/systemd/system/webhostcli-metrics.timer)"; rm -rf -- "$LIB" "$ETC"; note 'WebhostCLI management components removed; hosting infrastructure was preserved.'; }
+upgrade_cmd(){ local source="$1"; [[ -f "$source" ]] || die 3 'upgrade source not found'; bash "$source" install --repair; }
+
+interactive(){ while true; do cat <<'EOF'
+
+WebhostCLI Hosting Manager
+
+1. Accounts
+2. Domains and Aliases
+3. SFTP
+4. Databases
+5. SSL Certificates
+6. Resource Usage
+7. Limits and Quotas
+8. Backups and Restore
+9. PHP and Applications
+10. Cron and Queue Workers
+11. Services
+12. Logs
+13. Security
+14. Server Information
+15. Settings
+16. System Doctor
+0. Exit
+EOF
+ read -r -p 'Select: ' n; case "$n" in 1) list_accounts;; 14) server_cmd status;; 16) doctor;; 0) return;; *) echo 'Use direct commands for this module; see: webhostcli help';; esac; done; }
+help(){ cat <<'EOF'
+WebhostCLI 1.0.0
+Usage: webhostcli <module> <command> [options]
+
+Core: install [--bootstrap|--adopt-existing|--repair], upgrade FILE, uninstall [--purge-all], doctor, version
+Accounts: account list|show|create|start|stop|restart|suspend|unsuspend|suspend-web|unsuspend-web|suspend-sftp|unsuspend-sftp|suspend-database|unsuspend-database|credentials|repair|verify|logs|containers|delete|import-existing
+Domains: domain list|show|check|alias-add|alias-remove|primary-change
+SFTP: sftp show|enable|disable|password-reset|sessions ACCOUNT
+Database: database show|size|password-reset|export|import|create-extra|list|drop-extra ACCOUNT
+SSL: ssl issue|status|renew|renew-all|revoke ACCOUNT
+Monitoring: usage all|current|live|disk|bandwidth|database|report|top|rebuild; limits show|set|policy
+Backups: backup create|create-all|list|verify|restore|delete|schedule
+Applications: shell ACCOUNT [COMMAND...], composer ACCOUNT install|update|audit; php info|restart|config-show|config-set
+Other: cron ..., logs ..., service ..., server ..., security ...
+
+Use --json on supported read commands. Secrets are shown only by `account credentials ACCOUNT` to root.
+EOF
+}
+main(){ local first="${1:-}"; case "$first" in install) shift; install_cmd "$@"; return;; upgrade) shift; upgrade_cmd "$@"; return;; uninstall) shift; uninstall_cmd "$@"; return;; version|--version) echo "$VERSION"; return;; help|-h|--help) help; return;; esac
+ [[ -n "$first" ]] || { init_db; load_platform; interactive; return; }; init_db; load_platform
+ case "$first" in
+ doctor) doctor;; metrics-collect) collect_metrics;;
+ account) shift; local sub="${1:-}"; shift || true; case "$sub" in list) [[ "${1:-}" == --json ]] && JSON=true; list_accounts;; show) local a="$1"; [[ "${2:-}" == --json ]] && JSON=true; show_account "$a";; create) create_account "$@";; start|stop|restart) account_service "$sub" "$1";; suspend|unsuspend|suspend-web|unsuspend-web|suspend-sftp|unsuspend-sftp|suspend-database|unsuspend-database) local mode=full; case "$sub" in *-web) mode=web;; *-sftp) mode=sftp;; *-database) mode=database;; esac; local reason=; [[ "${2:-}" == --reason ]] && reason="$3"; [[ "$sub" == suspend* ]] && suspend_account "$1" "$mode" "$reason" || unsuspend_account "$1" "$mode";; credentials) check_account "$1"; require_root; echo "SFTP username: $1"; echo "SFTP password: $(read_secret "$1" SFTP_PASSWORD)"; echo "Database password: $(read_secret "$1" DB_PASSWORD)";; repair) check_account "$1"; render_account "$1"; nginx_test_reload; compose "$1" up -d;; verify) check_account "$1"; compose "$1" config; [[ -f "$ETC/nginx/$1.conf" ]] || die 6 'missing nginx config'; echo OK;; logs) logs_cmd tail "$1";; containers) check_account "$1"; compose "$1" ps;; import-existing) import_existing;; delete) local a="$1"; check_account "$a"; [[ "${2:-}" == --permanent ]] && { [[ "${WEBHOSTCLI_CONFIRM_DELETE:-}" == "$a" ]] || die 2 "set WEBHOSTCLI_CONFIRM_DELETE=$a to confirm permanent deletion"; compose "$a" down; rm -rf -- "$(account_dir "$a")"; db "DELETE FROM accounts WHERE account='$(sql_escape "$a")';"; } || { echo "Deletion summary for $a:"; show_account "$a"; echo "Set WEBHOSTCLI_CONFIRM_DELETE=$a then rerun with --permanent to delete."; };;
+ *) die 2 'unknown account command';; esac;;
+ domain) shift; domain_cmd "$@";; ssl) shift; ssl_cmd "$@";; sftp) shift; sftp_cmd "$@";; database) shift; database_cmd "$@";; usage) shift; usage_cmd "$@";; limits) shift; limits_cmd "$@";; backup) shift; backup_cmd "$@";; php) shift; php_cmd "$@";; shell) shift; shell_cmd "$@";; composer) shift; composer_cmd "$@";; cron) shift; cron_cmd "$@";; logs) shift; logs_cmd "$@";; service) shift; service_cmd "$@";; server) shift; server_cmd "$@";; security) shift; security_cmd "$@";; *) die 2 "unknown command: $first (run: webhostcli help)";; esac; }
+main "$@"
