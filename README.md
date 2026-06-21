@@ -66,8 +66,9 @@ sudo webhostcli account create client01 example.com
 sudo webhostcli login client01
 
 # 3. Install any application inside the container
+rm -rf public_html
 composer create-project laravel/laravel .
-rm -rf public_html && ln -s public public_html
+ln -s public public_html
 exit
 
 # 4. Basic operations
