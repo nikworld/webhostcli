@@ -430,9 +430,21 @@ CUSTOMER_UID_END=59999
 EOF
   touch /etc/hosting-platform/bootstrap.complete
 }
+ensure_webhostcli_dependencies(){
+  # Kept deliberately small for an adopted/legacy server: do not alter hosting services.
+  simulated && return 0
+  local packages=()
+  cmd_exists sqlite3 || packages+=(sqlite3)
+  cmd_exists python3 || packages+=(python3)
+  ((${#packages[@]} == 0)) && return 0
+  cmd_exists apt-get || die "$EXIT_DEPENDENCY" "missing required commands: ${packages[*]} (install them manually)"
+  note "Installing missing WebhostCLI dependency: ${packages[*]}"
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+}
 install_cmd(){ local bootstrap=0 adopt=0 repair=0; while (($#)); do case "$1" in --bootstrap) bootstrap=1;; --adopt-existing) adopt=1;; --repair) repair=1;; *) die 2 "unknown install option: $1";; esac; shift; done; require_root; if [[ -f "$BOOTSTRAP_MARKER" && -f "$PLATFORM_ENV" ]]; then note 'Existing hosting bootstrap detected.'; note 'Reusing installed infrastructure.'; elif ! simulated && { cmd_exists docker || cmd_exists nginx; } && (( !adopt && !bootstrap )); then die 5 'Docker or Nginx exists without a bootstrap marker; rerun with --adopt-existing after reviewing the server'; elif ((bootstrap)) && ! simulated && [[ "${CONFIRM_FRESH_SERVER:-}" != YES ]]; then die 7 'fresh bootstrap requires CONFIRM_FRESH_SERVER=YES'; fi
  if ((bootstrap)) && ! simulated && [[ ! -f "$BOOTSTRAP_MARKER" ]]; then bootstrap_fresh; fi
- load_platform; mkdirs; init_db; write_templates; install_units; if [[ -f "$(path /etc/hosting-platform/accounts.tsv)" ]]; then import_existing; fi
+ ensure_webhostcli_dependencies; load_platform; mkdirs; init_db; write_templates; install_units; if [[ -f "$(path /etc/hosting-platform/accounts.tsv)" ]]; then import_existing; fi
  if [[ "$(readlink -f "$0")" != "$(readlink -f "$BIN" 2>/dev/null || true)" ]]; then install -D -m 0750 "$0" "$BIN"; fi; printf '%s\n' "$VERSION" >"$LIB/version"; audit '' install success; note "WebhostCLI $VERSION installed. Run: sudo webhostcli doctor"; }
 uninstall_cmd(){ local purge=0; [[ "${1:-}" == --purge-all ]] && purge=1; require_root; if ((purge)); then [[ "${WEBHOSTCLI_CONFIRM_PURGE:-}" == DESTROY_HOSTING_DATA ]] || die 2 'set WEBHOSTCLI_CONFIRM_PURGE=DESTROY_HOSTING_DATA to purge all hosting data'; rm -rf -- "$CUSTOMER_ROOT" "$SRV/backups" "$DB"; fi; [[ -n "$ROOT" ]] || systemctl disable --now webhostcli-metrics.timer 2>/dev/null || true; rm -f "$BIN" "$(path /etc/systemd/system/webhostcli-metrics.service)" "$(path /etc/systemd/system/webhostcli-metrics.timer)"; rm -rf -- "$LIB" "$ETC"; note 'WebhostCLI management components removed; hosting infrastructure was preserved.'; }
 upgrade_cmd(){ local source="$1"; [[ -f "$source" ]] || die 3 'upgrade source not found'; bash "$source" install --repair; }
