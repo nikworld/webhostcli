@@ -41,7 +41,7 @@ pass 'UID and port allocation'
 grep -q 'no-new-privileges' "$TMP/root/srv/hosting/customers/generic01/compose.yaml"
 pass 'generic profile generation and security flags'
 must_fail "$INST" account create framework01 framework.test --profile laravel
-must "$INST" shell generic01 php -v
+must "$INST" login generic01 php -v
 must "$INST" composer generic01 --version
 pass 'universal application shell and no framework-specific profile'
 must "$INST" account verify generic01; pass 'compose and Nginx generated files'
